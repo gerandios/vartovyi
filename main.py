@@ -37,8 +37,8 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 DATABASE_URL = os.getenv('DATABASE_URL')
 API_KEY = os.getenv('API_KEY')
-WEBHOOK_PATH = '/webhook'  # Шлях для webhook
-DOMAIN = os.getenv('RENDER_EXTERNAL_HOSTNAME')  # Автоматично з Render, або вкажіть ваш .onrender.com
+WEBHOOK_PATH = '/webhook'
+DOMAIN = os.getenv('RENDER_EXTERNAL_HOSTNAME')
 
 if not all([BOT_TOKEN, DATABASE_URL, API_KEY, DOMAIN]):
     raise ValueError("Missing environment variables")
@@ -73,10 +73,10 @@ with pool.connection() as conn:
 REG_NAME = 0
 CHOOSE_DATE, CHOOSE_TYPE = range(2)
 
-# Validation regex for name: І. Прізвище (Ukrainian letters allowed)
-NAME_REGEX = re.compile(r'^[А-Я ЇІЄҐ]\. [А-Я ЇІЄҐ][а-я їієґʼ\-]+$', re.IGNORECASE)
+# Validation regex for name
+NAME_REGEX = re.compile(r'^[А-ЯЇІЄҐ]\. [А-ЯЇІЄҐ][а-яїієґʼ\-]+$', re.IGNORECASE)
 
-# Helper functions for DB (залишаються ті самі)
+# Helper functions for DB
 def insert_user(user_id: int, registered_name: str, username: str | None) -> None:
     with pool.connection() as conn:
         conn.execute(
@@ -87,6 +87,7 @@ def insert_user(user_id: int, registered_name: str, username: str | None) -> Non
             (user_id, registered_name, username, datetime.utcnow()),
         )
         conn.commit()
+    logger.info(f"User {user_id} registered as {registered_name}")
 
 def get_user(user_id: int) -> tuple | None:
     with pool.connection() as conn:
@@ -94,7 +95,9 @@ def get_user(user_id: int) -> tuple | None:
             "SELECT registered_name, username FROM users WHERE user_id = %s",
             (user_id,),
         )
-        return cur.fetchone()
+        result = cur.fetchone()
+        logger.info(f"Getting user {user_id}: {result}")
+        return result
 
 def insert_registration(user_id: int, event_type: str, event_date: date) -> bool:
     try:
@@ -107,8 +110,10 @@ def insert_registration(user_id: int, event_type: str, event_date: date) -> bool
                 (user_id, event_type, event_date),
             )
             conn.commit()
+        logger.info(f"Registration added for user {user_id}: {event_type} on {event_date}")
         return True
     except psycopg.errors.UniqueViolation:
+        logger.warning(f"Duplicate registration for user {user_id} on {event_date}")
         return False
 
 def get_user_registrations(user_id: int) -> list:
@@ -123,12 +128,15 @@ def get_user_registrations(user_id: int) -> list:
             """,
             (user_id, today),
         )
-        return cur.fetchall()
+        result = cur.fetchall()
+        logger.info(f"Getting registrations for user {user_id}: {result}")
+        return result
 
 def delete_registration(reg_id: int) -> None:
     with pool.connection() as conn:
         conn.execute("DELETE FROM registrations WHERE id = %s", (reg_id,))
         conn.commit()
+    logger.info(f"Registration {reg_id} deleted")
 
 def get_lists_for_date(target_date: date) -> dict:
     with pool.connection() as conn:
@@ -154,13 +162,13 @@ def get_lists_for_date(target_date: date) -> dict:
         "lists": lists,
     }
 
-# Bot handlers (залишаються ті самі, але без polling)
-async def start(update: Update, context: CallbackContext) -> int | None:
+# Bot handlers
+async def start(update: Update, context: CallbackContext) -> int:
     user_id = update.effective_user.id
     user = get_user(user_id)
     if user:
         await show_main_menu(update, context)
-        return None
+        return ConversationHandler.END
     else:
         await update.message.reply_text(
             'Вітаю! Для використання бота пройдіть реєстрацію.\n'
@@ -169,7 +177,7 @@ async def start(update: Update, context: CallbackContext) -> int | None:
         )
         return REG_NAME
 
-async def register_name(update: Update, context: CallbackContext) -> int | None:
+async def register_name(update: Update, context: CallbackContext) -> int:
     user_id = update.effective_user.id
     text = update.message.text.strip()
     if NAME_REGEX.match(text):
@@ -190,37 +198,48 @@ async def show_main_menu(update: Update, context: CallbackContext) -> None:
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     await update.message.reply_text('Головне меню:', reply_markup=reply_markup)
 
-async def handle_text(update: Update, context: CallbackContext) -> None:
+async def handle_menu(update: Update, context: CallbackContext) -> int:
     text = update.message.text
     user_id = update.effective_user.id
+    
+    logger.info(f"User {user_id} selected: {text}")
+    
     user = get_user(user_id)
     if not user:
-        await start(update, context)
-        return
+        await update.message.reply_text('Спочатку зареєструйтеся за допомогою /start')
+        return ConversationHandler.END
 
     if text == 'Записатись на звільнення':
-        await start_registration(update, context)
+        today = date.today()
+        tomorrow = today + timedelta(days=1)
+        context.user_data['dates'] = {
+            'Сьогодні': today,
+            'Завтра': tomorrow,
+        }
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton('Сьогодні', callback_data='date:Сьогодні')],
+             [InlineKeyboardButton('Завтра', callback_data='date:Завтра')]]
+        )
+        await update.message.reply_text('Оберіть дату:', reply_markup=keyboard)
+        return CHOOSE_DATE
+        
     elif text == 'Мої записи':
-        await show_registrations(update, context)
+        regs = get_user_registrations(user_id)
+        if not regs:
+            await update.message.reply_text('У вас немає активних записів.')
+        else:
+            for reg_id, event_type, event_date in regs:
+                keyboard = InlineKeyboardMarkup(
+                    [[InlineKeyboardButton('Скасувати запис', callback_data=f'cancel:{reg_id}')]]
+                )
+                await update.message.reply_text(
+                    f'Дата: {event_date.strftime("%Y-%m-%d")}\nТип: {event_type}',
+                    reply_markup=keyboard,
+                )
+        return ConversationHandler.END
     else:
         await update.message.reply_text('Будь ласка, використовуйте кнопки для взаємодії.')
-
-async def ignore_non_text(update: Update, context: CallbackContext) -> None:
-    await update.message.reply_text('Будь ласка, використовуйте кнопки для взаємодії. Або /start для меню.')
-
-async def start_registration(update: Update, context: CallbackContext) -> int:
-    today = date.today()
-    tomorrow = today + timedelta(days=1)
-    context.user_data['dates'] = {
-        'Сьогодні': today,
-        'Завтра': tomorrow,
-    }
-    keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton('Сьогодні', callback_data='date:Сьогодні')],
-         [InlineKeyboardButton('Завтра', callback_data='date:Завтра')]]
-    )
-    await update.message.reply_text('Оберіть дату:', reply_markup=keyboard)
-    return CHOOSE_DATE
+        return ConversationHandler.END
 
 async def choose_date(update: Update, context: CallbackContext) -> int:
     query = update.callback_query
@@ -246,25 +265,9 @@ async def choose_type(update: Update, context: CallbackContext) -> int:
     else:
         msg = 'Ви вже записані на цю дату. Дублювання не дозволено.'
     await query.edit_message_text(msg)
-    del context.user_data['selected_date']
-    del context.user_data['dates']
+    context.user_data.pop('selected_date', None)
+    context.user_data.pop('dates', None)
     return ConversationHandler.END
-
-async def show_registrations(update: Update, context: CallbackContext) -> None:
-    user_id = update.effective_user.id
-    regs = get_user_registrations(user_id)
-    if not regs:
-        await update.message.reply_text('У вас немає активних записів.')
-        return
-
-    for reg_id, event_type, event_date in regs:
-        keyboard = InlineKeyboardMarkup(
-            [[InlineKeyboardButton('Скасувати запис', callback_data=f'cancel:{reg_id}')]]
-        )
-        await update.message.reply_text(
-            f'Дата: {event_date.strftime("%Y-%m-%d")}\nТип: {event_type}',
-            reply_markup=keyboard,
-        )
 
 async def cancel_registration(update: Update, context: CallbackContext) -> None:
     query = update.callback_query
@@ -273,13 +276,13 @@ async def cancel_registration(update: Update, context: CallbackContext) -> None:
     delete_registration(reg_id)
     await query.edit_message_text('Запис скасовано.')
 
-# FastAPI app з інтеграцією webhook
+# FastAPI app
 app = FastAPI()
 
-# Додайте application (Telegram bot)
+# Telegram bot application
 application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-# Додайте handlers (як раніше)
+# Registration conversation handler
 reg_handler = ConversationHandler(
     entry_points=[CommandHandler('start', start)],
     states={
@@ -287,22 +290,23 @@ reg_handler = ConversationHandler(
     },
     fallbacks=[CommandHandler('start', start)],
 )
-application.add_handler(reg_handler)
 
-conv_handler = ConversationHandler(
-    entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)],
+# Main menu conversation handler
+menu_handler = ConversationHandler(
+    entry_points=[MessageHandler(filters.Regex('^(Записатись на звільнення|Мої записи)$'), handle_menu)],
     states={
         CHOOSE_DATE: [CallbackQueryHandler(choose_date, pattern='^date:')],
         CHOOSE_TYPE: [CallbackQueryHandler(choose_type, pattern='^type:')],
     },
     fallbacks=[CommandHandler('start', start)],
 )
-application.add_handler(conv_handler)
 
-application.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, ignore_non_text))
+# Add handlers in correct order
+application.add_handler(reg_handler)
+application.add_handler(menu_handler)
 application.add_handler(CallbackQueryHandler(cancel_registration, pattern='^cancel:'))
 
-# Webhook endpoint в FastAPI
+# Webhook endpoint
 @app.post(WEBHOOK_PATH)
 async def process_update(request: Request):
     req = await request.json()
@@ -310,7 +314,7 @@ async def process_update(request: Request):
     await application.process_update(update)
     return {"ok": True}
 
-# API endpoint (залишається той самий)
+# API endpoint
 @app.get("/api/lists/{date_str}")
 async def get_lists(date_str: str, x_api_key: str = Header(None)):
     if x_api_key != API_KEY:
@@ -323,12 +327,16 @@ async def get_lists(date_str: str, x_api_key: str = Header(None)):
 
     return get_lists_for_date(target_date)
 
-# Запуск: Встановіть webhook при старті
+# Set webhook on startup
 @app.on_event("startup")
 async def startup():
-    await application.initialize()  # Додайте цей рядок для ініціалізації!
+    await application.initialize()
     await application.bot.set_webhook(url=WEBHOOK_URL)
     logger.info(f"Webhook set to {WEBHOOK_URL}")
+
+@app.on_event("shutdown")
+async def shutdown():
+    await application.shutdown()
 
 # Run app
 if __name__ == '__main__':
