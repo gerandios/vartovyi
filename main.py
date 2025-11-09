@@ -140,21 +140,35 @@ def delete_registration(reg_id: int) -> None:
 
 def get_lists_for_date(target_date: date) -> dict:
     with pool.connection() as conn:
-        cur = conn.execute(
-            """
-            SELECT r.event_type, u.registered_name, u.username
-            FROM registrations r
-            JOIN users u ON r.user_id = u.user_id
-            WHERE r.event_date = %s
-            ORDER BY r.event_type, u.registered_name
-            """,
-            (target_date,),
-        )
-        rows = cur.fetchall()
+        # Встановлюємо, щоб курсор повертав рядки у вигляді словників, а не кортежів
+        with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+            # === КЛЮЧОВЕ ВИПРАВЛЕННЯ: ===
+            # 1. Використовуємо SQL-псевдонім "AS", щоб примусово назвати стовпець "full_name".
+            # 2. Тепер результат буде гарантовано мати правильні ключі.
+            cur.execute(
+                """
+                SELECT 
+                    r.event_type, 
+                    u.registered_name AS full_name, 
+                    u.username
+                FROM registrations r
+                JOIN users u ON r.user_id = u.user_id
+                WHERE r.event_date = %s
+                ORDER BY r.event_type, u.registered_name
+                """,
+                (target_date,),
+            )
+            rows = cur.fetchall()
 
     lists = {"Звичайне": [], "Добове": []}
-    for event_type, full_name, username in rows:
-        lists[event_type].append({"full_name": full_name, "username": username})
+    # Тепер ми ітеруємо по словниках, де кожен ключ відповідає назві стовпця
+    for row in rows:
+        event_type = row['event_type']
+        # Ми просто копіюємо весь словник, не турбуючись про окремі поля
+        lists[event_type].append({
+            "full_name": row['full_name'],
+            "username": row['username']
+        })
 
     return {
         "request_date": target_date.isoformat(),
@@ -341,3 +355,4 @@ async def shutdown():
 # Run app
 if __name__ == '__main__':
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+
