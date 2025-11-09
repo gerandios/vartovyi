@@ -1,4 +1,3 @@
-```python
 import os
 import logging
 import re
@@ -321,4 +320,3 @@ async def get_lists(date_str: str, x_api_key: str = Header(None)):
 if __name__ == '__main__':
     threading.Thread(target=setup_bot, daemon=True).start()
     uvicorn.run(app, host="0.0.0.0", port=8000)
-```
