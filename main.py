@@ -326,6 +326,7 @@ async def get_lists(date_str: str, x_api_key: str = Header(None)):
 # Запуск: Встановіть webhook при старті
 @app.on_event("startup")
 async def startup():
+    await application.initialize()  # Додайте цей рядок для ініціалізації!
     await application.bot.set_webhook(url=WEBHOOK_URL)
     logger.info(f"Webhook set to {WEBHOOK_URL}")
 
