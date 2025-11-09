@@ -1,7 +1,6 @@
 import os
 import logging
 import re
-import threading
 from datetime import datetime, date, timedelta
 
 from telegram import (
@@ -24,7 +23,7 @@ from telegram.ext import (
 import psycopg
 from psycopg_pool import ConnectionPool
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, Request, HTTPException, Header
 import uvicorn
 
 # Logging setup
@@ -38,12 +37,13 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 DATABASE_URL = os.getenv('DATABASE_URL')
 API_KEY = os.getenv('API_KEY')
-print("BOT_TOKEN:", os.getenv('BOT_TOKEN'))
-print("DATABASE_URL:", os.getenv('DATABASE_URL'))
-print("API_KEY:", os.getenv('API_KEY'))
+WEBHOOK_PATH = '/webhook'  # Шлях для webhook
+DOMAIN = os.getenv('RENDER_EXTERNAL_HOSTNAME')  # Автоматично з Render, або вкажіть ваш .onrender.com
 
-if not all([BOT_TOKEN, DATABASE_URL, API_KEY]):
+if not all([BOT_TOKEN, DATABASE_URL, API_KEY, DOMAIN]):
     raise ValueError("Missing environment variables")
+
+WEBHOOK_URL = f"https://{DOMAIN}{WEBHOOK_PATH}"
 
 # Database connection pool
 pool = ConnectionPool(DATABASE_URL, min_size=1, max_size=10)
@@ -74,9 +74,9 @@ REG_NAME = 0
 CHOOSE_DATE, CHOOSE_TYPE = range(2)
 
 # Validation regex for name: І. Прізвище (Ukrainian letters allowed)
-NAME_REGEX = re.compile(r'^[А-ЯЇІЄҐ]\. [А-ЯЇІЄҐ][а-я їієґʼ\-]+$', re.IGNORECASE)
+NAME_REGEX = re.compile(r'^[А-Я ЇІЄҐ]\. [А-Я ЇІЄҐ][а-я їієґʼ\-]+$', re.IGNORECASE)
 
-# Helper functions for DB
+# Helper functions for DB (залишаються ті самі)
 def insert_user(user_id: int, registered_name: str, username: str | None) -> None:
     with pool.connection() as conn:
         conn.execute(
@@ -154,7 +154,7 @@ def get_lists_for_date(target_date: date) -> dict:
         "lists": lists,
     }
 
-# Bot handlers
+# Bot handlers (залишаються ті самі, але без polling)
 async def start(update: Update, context: CallbackContext) -> int | None:
     user_id = update.effective_user.id
     user = get_user(user_id)
@@ -273,40 +273,44 @@ async def cancel_registration(update: Update, context: CallbackContext) -> None:
     delete_registration(reg_id)
     await query.edit_message_text('Запис скасовано.')
 
-# Setup bot
-def setup_bot():
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    reg_handler = ConversationHandler(
-        entry_points=[CommandHandler('start', start)],
-        states={
-            REG_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_name)],
-        },
-        fallbacks=[CommandHandler('start', start)],
-    )
-    application.add_handler(reg_handler)
-
-    conv_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)],
-        states={
-            CHOOSE_DATE: [CallbackQueryHandler(choose_date, pattern='^date:')],
-            CHOOSE_TYPE: [CallbackQueryHandler(choose_type, pattern='^type:')],
-        },
-        fallbacks=[CommandHandler('start', start)],
-        map_to_parent={
-            ConversationHandler.END: ConversationHandler.END,
-        },
-    )
-    application.add_handler(conv_handler)
-
-    application.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, ignore_non_text))
-    application.add_handler(CallbackQueryHandler(cancel_registration, pattern='^cancel:'))
-
-    application.run_polling()
-
-# FastAPI app
+# FastAPI app з інтеграцією webhook
 app = FastAPI()
 
+# Додайте application (Telegram bot)
+application = ApplicationBuilder().token(BOT_TOKEN).build()
+
+# Додайте handlers (як раніше)
+reg_handler = ConversationHandler(
+    entry_points=[CommandHandler('start', start)],
+    states={
+        REG_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_name)],
+    },
+    fallbacks=[CommandHandler('start', start)],
+)
+application.add_handler(reg_handler)
+
+conv_handler = ConversationHandler(
+    entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)],
+    states={
+        CHOOSE_DATE: [CallbackQueryHandler(choose_date, pattern='^date:')],
+        CHOOSE_TYPE: [CallbackQueryHandler(choose_type, pattern='^type:')],
+    },
+    fallbacks=[CommandHandler('start', start)],
+)
+application.add_handler(conv_handler)
+
+application.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, ignore_non_text))
+application.add_handler(CallbackQueryHandler(cancel_registration, pattern='^cancel:'))
+
+# Webhook endpoint в FastAPI
+@app.post(WEBHOOK_PATH)
+async def process_update(request: Request):
+    req = await request.json()
+    update = Update.de_json(req, application.bot)
+    await application.process_update(update)
+    return {"ok": True}
+
+# API endpoint (залишається той самий)
 @app.get("/api/lists/{date_str}")
 async def get_lists(date_str: str, x_api_key: str = Header(None)):
     if x_api_key != API_KEY:
@@ -319,8 +323,12 @@ async def get_lists(date_str: str, x_api_key: str = Header(None)):
 
     return get_lists_for_date(target_date)
 
-# Run API and bot
-if __name__ == '__main__':
-    threading.Thread(target=setup_bot, daemon=True).start()
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+# Запуск: Встановіть webhook при старті
+@app.on_event("startup")
+async def startup():
+    await application.bot.set_webhook(url=WEBHOOK_URL)
+    logger.info(f"Webhook set to {WEBHOOK_URL}")
 
+# Run app
+if __name__ == '__main__':
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
