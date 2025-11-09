@@ -38,6 +38,9 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 DATABASE_URL = os.getenv('DATABASE_URL')
 API_KEY = os.getenv('API_KEY')
+print("BOT_TOKEN:", os.getenv('BOT_TOKEN'))
+print("DATABASE_URL:", os.getenv('DATABASE_URL'))
+print("API_KEY:", os.getenv('API_KEY'))
 
 if not all([BOT_TOKEN, DATABASE_URL, API_KEY]):
     raise ValueError("Missing environment variables")
@@ -320,3 +323,4 @@ async def get_lists(date_str: str, x_api_key: str = Header(None)):
 if __name__ == '__main__':
     threading.Thread(target=setup_bot, daemon=True).start()
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
