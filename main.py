@@ -488,10 +488,14 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
     await application.shutdown()
-@app.get("/ping")
-async def keep_alive():
-    # Просто легкий ответ, чтобы Render понял, что мы живы
-    return {"status": "I am alive"}
+@app.get("/health", status_code=status.HTTP_200_OK)
+async def health_check():
+    """
+    Проверяет, что веб-сервис запущен и отвечает.
+    Возвращает HTTP 200 OK с пустым телом.
+    Это стандартная практика для keep-alive пингов и health checks.
+    """
+    return Response(status_code=status.HTTP_200_OK)
 if __name__ == '__main__':
     # Эта часть для локального запуска, на Render она не будет выполняться
     PORT = int(os.environ.get("PORT", 8000))
