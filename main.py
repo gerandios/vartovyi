@@ -615,7 +615,7 @@ async def get_constructor_page():
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="File 'ai_studio_code (23).html' not found.")
 
-@app.get("/health", status_code=status.HTTP_200_OK)
+@app.api_route("/health", methods=["GET", "HEAD"], status_code=status.HTTP_200_OK)
 async def health_check():
     return Response(status_code=status.HTTP_200_OK)
 
