@@ -195,11 +195,31 @@ def get_lists_for_date(target_date: date) -> dict:
                 """, (target_date,)
             )
             rows = cur.fetchall()
+            
     lists = {"Звичайне": [], "Добове": []}
     for row in rows:
-        # Добавляем event_type внутрь объекта для удобства фронтенда
+        # Конвертируем строку из БД в изменяемый словарь
         row_data = dict(row)
+        
+        # --- ИСПРАВЛЕНИЕ БАГА С РЕГИСТРОМ ЗВАНИЯ ---
+        full_name = row_data.get('full_name', '')
+        if full_name:
+            parts = full_name.split(' ')
+            # Проверяем звания, состоящие из двух слов (например, "ст. солдат")
+            if len(parts) > 1 and parts[0].lower() == 'ст.':
+                parts[0] = parts[0].lower() # -> 'ст.'
+                parts[1] = parts[1].lower() # -> 'солдат'
+            # Для званий из одного слова
+            elif parts:
+                parts[0] = parts[0].lower() # -> 'солдат'
+            
+            # Собираем имя обратно и обновляем его в словаре
+            row_data['full_name'] = ' '.join(parts)
+        # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
+
+        # Добавляем event_type внутрь объекта для удобства фронтенда
         lists[row['event_type']].append(row_data)
+        
     return {"request_date": target_date.isoformat(), "total_registrations": len(rows), "lists": lists}
 
 def clear_future_registrations() -> int:
