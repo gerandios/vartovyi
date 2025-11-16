@@ -7,8 +7,7 @@ from fastapi import FastAPI, Request, HTTPException, Header, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
-from telegram import (
-    Update,import os
+import os
 import logging
 import calendar
 from datetime import datetime, date, timedelta, timezone
