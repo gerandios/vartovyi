@@ -488,7 +488,10 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
     await application.shutdown()
-
+@app.get("/ping")
+async def keep_alive():
+    # Просто легкий ответ, чтобы Render понял, что мы живы
+    return {"status": "I am alive"}
 if __name__ == '__main__':
     # Эта часть для локального запуска, на Render она не будет выполняться
     PORT = int(os.environ.get("PORT", 8000))
