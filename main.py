@@ -1,7 +1,7 @@
 import os
 import logging
 import re
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 import calendar
 
 from telegram import (
@@ -62,7 +62,8 @@ with pool.connection() as conn:
         group_number VARCHAR,
         registration_date TIMESTAMP WITH TIME ZONE NOT NULL
     );
-    """)
+    """
+    )
     conn.execute("""
     CREATE TABLE IF NOT EXISTS registrations (
         id SERIAL PRIMARY KEY,
@@ -71,7 +72,8 @@ with pool.connection() as conn:
         event_date DATE NOT NULL,
         UNIQUE (user_id, event_date)
     );
-    """)
+    """
+    )
     conn.commit()
 
 # States for ConversationHandlers
@@ -92,7 +94,7 @@ def insert_user(user_id: int, registered_name: str, username: str | None, group_
                 username = EXCLUDED.username,
                 group_number = EXCLUDED.group_number;
             """,
-            (user_id, registered_name, username, group_number, datetime.utcnow()),
+            (user_id, registered_name, username, group_number, datetime.now(timezone.utc)),
         )
 
 def get_user(user_id: int) -> dict | None:
@@ -100,6 +102,7 @@ def get_user(user_id: int) -> dict | None:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
             return cur.fetchone()
+
 
 def update_user_field(user_id: int, field: str, value: str) -> None:
     if field not in ['registered_name', 'group_number']: raise ValueError("Invalid field")
@@ -110,11 +113,14 @@ def update_user_field(user_id: int, field: str, value: str) -> None:
         conn.execute(query, (value, user_id))
 
 def insert_registration(user_id: int, event_type: str, event_date: date) -> bool:
+    if event_type not in ('Звичайне', 'Добове'):
+        raise ValueError('Invalid event_type')
     try:
         with pool.connection() as conn:
             conn.execute("INSERT INTO registrations (user_id, event_type, event_date) VALUES (%s, %s, %s)", (user_id, event_type, event_date))
         return True
-    except psycopg.errors.UniqueViolation: return False
+    except psycopg.errors.UniqueViolation:
+        return False
 
 def get_user_registrations(user_id: int) -> list:
     with pool.connection() as conn:
@@ -184,8 +190,40 @@ def create_calendar(year: int, month: int) -> InlineKeyboardMarkup:
     keyboard.append(nav_row)
     return InlineKeyboardMarkup(keyboard)
 
+# --- Safe reply utilities (fixes message vs callback handling and avoids UI spinners) ---
+async def safe_reply(update, context, text, reply_markup=None, edit=False):
+    """
+    Универсальный ответ: корректно отвечает и для callback_query, и для message.
+    Если edit=True и это callback_query, попробуем edit_message_text.
+    """
+    if getattr(update, "callback_query", None):
+        try:
+            await update.callback_query.answer()
+        except Exception:
+            pass
+        if edit:
+            try:
+                await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
+                return
+            except Exception:
+                pass
+        if update.callback_query.message:
+            await update.callback_query.message.reply_text(text, reply_markup=reply_markup)
+            return
+    if getattr(update, "message", None):
+        await update.message.reply_text(text, reply_markup=reply_markup)
+        return
+    if update.effective_chat:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=text, reply_markup=reply_markup)
+
+# --- safer main menu that works for callback_query too ---
+async def safe_show_main_menu(update, context):
+    keyboard = [['Записатись на звільнення', 'Мої записи']]
+    await safe_reply(update, context, 'Головне меню:', reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+
 # --- Bot Handlers ---
 async def show_main_menu(update: Update):
+    # kept for backward compatibility but prefer safe_show_main_menu
     keyboard = [['Записатись на звільнення', 'Мої записи']]
     await update.message.reply_text('Головне меню:', reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
 
@@ -193,11 +231,11 @@ async def start(update: Update, context: CallbackContext) -> int:
     user_id = update.effective_user.id
     context.user_data.clear() # Очищуємо дані попередніх розмов
     if get_user(user_id):
-        await show_main_menu(update)
+        await safe_show_main_menu(update, context)
         return ConversationHandler.END
     else:
         await update.message.reply_text(
-            'Вітаю! Для використання бота пройдіть реєстрацію.\n'
+            'Вітаю! Для використання бота пройдіть реєстрацію.
             'Введіть ваше звання та прізвище з ініціалами (наприклад, ст. солдат К.Пижко)',
             reply_markup=ReplyKeyboardRemove(),
         )
@@ -218,25 +256,32 @@ async def register_group(update: Update, context: CallbackContext) -> int:
     insert_user(update.effective_user.id, registered_name, update.effective_user.username, group_number)
     await update.message.reply_text(f'Реєстрацію завершено! Ви зареєстровані як {registered_name}, група {group_number}.')
     context.user_data.clear()
-    await show_main_menu(update)
+    await safe_show_main_menu(update, context)
     return ConversationHandler.END
 
 async def handle_menu(update: Update, context: CallbackContext) -> int:
-    text = update.message.text
-    if text == 'Записатись на звільнення':
+    # Normalize incoming text to be resilient to case and spaces
+    if not update.message or not update.message.text:
+        return ConversationHandler.END
+    text = update.message.text.strip().lower()
+    if text == 'записатись на звільнення':
         keyboard = [
             [InlineKeyboardButton('На завтра', callback_data=f'day:{(date.today() + timedelta(days=1)).isoformat()}')],
             [InlineKeyboardButton('Обрати іншу дату', callback_data='calendar')]
         ]
-        await update.message.reply_text('Оберіть дату звільнення:', reply_markup=InlineKeyboardMarkup(keyboard))
+        await safe_reply(update, context, 'Оберіть дату звільнення:', reply_markup=InlineKeyboardMarkup(keyboard))
         return CHOOSE_DATE
-    elif text == 'Мої записи':
+    elif text == 'мої записи':
         regs = get_user_registrations(update.effective_user.id)
-        if not regs: await update.message.reply_text('У вас немає активних записів.')
+        if not regs: await safe_reply(update, context, 'У вас немає активних записів.')
         else:
             for reg in regs:
                 keyboard = InlineKeyboardMarkup([[InlineKeyboardButton('Скасувати запис', callback_data=f'cancel:{reg["id"]}')]])
-                await update.message.reply_text(f'Дата: {reg["event_date"]:%d.%m.%Y}\nТип: {reg["event_type"]}', reply_markup=keyboard)
+                await safe_reply(update, context, f'Дата: {reg["event_date"]:%d.%m.%Y}
+Тип: {reg["event_type"]}', reply_markup=keyboard)
+        return ConversationHandler.END
+    else:
+        await safe_show_main_menu(update, context)
         return ConversationHandler.END
 
 async def date_callback_handler(update: Update, context: CallbackContext) -> int:
@@ -260,8 +305,16 @@ async def date_callback_handler(update: Update, context: CallbackContext) -> int
 async def choose_type(update: Update, context: CallbackContext) -> int:
     query = update.callback_query; await query.answer()
     event_type = query.data.split(':')[1]
-    success = insert_registration(update.effective_user.id, event_type, context.user_data['selected_date'])
-    msg = f'✅ Ви успішно записалися на {event_type} звільнення на {context.user_data["selected_date"]:%d.%m.%Y}.' if success else '⚠️ Ви вже записані на цю дату.'
+    selected = context.user_data.get('selected_date')
+    if not selected:
+        await safe_reply(update, context, "Вибачте, термін дії сесії вичерпано. Будь ласка, почніть заново.")
+        return ConversationHandler.END
+    try:
+        success = insert_registration(update.effective_user.id, event_type, selected)
+    except ValueError:
+        await safe_reply(update, context, "Невідомий тип звільнення.")
+        return ConversationHandler.END
+    msg = f'✅ Ви успішно записалися на {event_type} звільнення на {selected:%d.%m.%Y}.' if success else '⚠️ Ви вже записані на цю дату.'
     await query.edit_message_text(msg)
     context.user_data.clear()
     return ConversationHandler.END
@@ -298,8 +351,14 @@ async def edit_choose_field(update: Update, context: CallbackContext) -> int:
     return EDIT_GET_NEW_VALUE
 
 async def edit_get_new_value(update: Update, context: CallbackContext) -> int:
-    update_user_field(context.user_data['edit_user_id'], context.user_data['edit_field'], update.message.text.strip())
-    await update.message.reply_text(f"✅ Дані для користувача {context.user_data['edit_user_id']} успішно оновлено.")
+    user_id = context.user_data.get('edit_user_id')
+    field = context.user_data.get('edit_field')
+    if not user_id or not field:
+        await safe_reply(update, context, "Сесія редагування втрачена. Почніть знову.")
+        context.user_data.clear()
+        return ConversationHandler.END
+    update_user_field(user_id, field, update.message.text.strip())
+    await update.message.reply_text(f"✅ Дані для користувача {user_id} успішно оновлено.")
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -331,10 +390,18 @@ async def admin_panel_callback(update: Update, context: CallbackContext):
     elif action == 'cancel':
         await query.edit_message_text("Дію скасовано.")
 
+# handler for ignore-buttons to prevent spinner
+async def ignore_callback(update: Update, context: CallbackContext):
+    if getattr(update, 'callback_query', None):
+        try:
+            await update.callback_query.answer()
+        except Exception:
+            pass
+
 # ### FIX ### Надійні обробники для виходу з діалогів
 async def cancel(update: Update, context: CallbackContext) -> int:
     await update.message.reply_text("Дію скасовано.", reply_markup=ReplyKeyboardRemove())
-    await show_main_menu(update)
+    await safe_show_main_menu(update, context)
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -343,10 +410,10 @@ app = FastAPI()
 application = ApplicationBuilder().token(BOT_TOKEN).build()
 
 # ### FIX ### Додано надійні fallbacks до кожного ConversationHandler
-common_fallbacks = [CommandHandler('start', start), CommandHandler('cancel', cancel)]
+common_fallbacks = [CommandHandler('/start', start), CommandHandler('/cancel', cancel)]
 
 reg_handler = ConversationHandler(
-    entry_points=[CommandHandler('start', start)],
+    entry_points=[CommandHandler('/start', start)],
     states={
         REG_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_name)],
         REG_GROUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_group)],
@@ -354,7 +421,7 @@ reg_handler = ConversationHandler(
     fallbacks=common_fallbacks,
 )
 menu_handler = ConversationHandler(
-    entry_points=[MessageHandler(filters.Regex('^(Записатись на звільнення|Мої записи)$'), handle_menu)],
+    entry_points=[MessageHandler(filters.Regex('^(?i)(Записатись на звільнення|Мої записи)\s*$'), handle_menu)],
     states={
         CHOOSE_DATE: [CallbackQueryHandler(date_callback_handler)],
         CHOOSE_TYPE: [CallbackQueryHandler(choose_type, pattern='^type:')],
@@ -362,7 +429,7 @@ menu_handler = ConversationHandler(
     fallbacks=common_fallbacks,
 )
 edit_handler = ConversationHandler(
-    entry_points=[CommandHandler('edit', edit_start)],
+    entry_points=[CommandHandler('/edit', edit_start)],
     states={
         EDIT_GET_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_get_id)],
         EDIT_CHOOSE_FIELD: [CallbackQueryHandler(edit_choose_field, pattern='^edit_field:')],
@@ -374,7 +441,9 @@ edit_handler = ConversationHandler(
 application.add_handler(reg_handler)
 application.add_handler(menu_handler)
 application.add_handler(edit_handler)
-application.add_handler(CommandHandler('admin', admin_panel)) # ### NEW ###
+# add ignore handler first to quickly answer inert callbacks
+application.add_handler(CallbackQueryHandler(ignore_callback, pattern='^ignore$'))
+application.add_handler(CommandHandler('/admin', admin_panel)) # ### NEW ###
 application.add_handler(CallbackQueryHandler(admin_panel_callback, pattern='^admin:')) # ### NEW ###
 application.add_handler(CallbackQueryHandler(cancel_registration, pattern='^cancel:'))
 
