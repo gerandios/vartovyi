@@ -235,8 +235,8 @@ async def start(update: Update, context: CallbackContext) -> int:
         return ConversationHandler.END
     else:
         await update.message.reply_text(
-            'Вітаю! Для використання бота пройдіть реєстрацію.
-            'Введіть ваше звання та прізвище з ініціалами (наприклад, ст. солдат К.Пижко)',
+            "Вітаю! Для використання бота пройдіть реєстрацію.
+             Введіть ваше звання та прізвище з ініціалами (наприклад, ст. солдат К.Пижко)",
             reply_markup=ReplyKeyboardRemove(),
         )
         return REG_NAME
