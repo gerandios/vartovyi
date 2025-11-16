@@ -126,7 +126,6 @@ except Exception as e:
 ) = range(10) # Увеличили диапазон до 10
 
 # --- Функции для работы с БД ---
-# ... (insert_user, get_user, update_user_field - без изменений)
 def insert_user(user_id: int, registered_name: str, username: str | None, group_number: str) -> None:
     with pool.connection() as conn:
         conn.execute(
@@ -168,7 +167,6 @@ def insert_registration(user_id: int, event_type: str, event_date: date, reason:
             )
         return True
     except psycopg.errors.UniqueViolation:
-        # Этот блок теперь не должен срабатывать из-за ON CONFLICT, но оставим на всякий случай
         return False
 
 def get_user_registrations(user_id: int) -> list:
@@ -199,7 +197,9 @@ def get_lists_for_date(target_date: date) -> dict:
             rows = cur.fetchall()
     lists = {"Звичайне": [], "Добове": []}
     for row in rows:
-        lists[row['event_type']].append(row)
+        # Добавляем event_type внутрь объекта для удобства фронтенда
+        row_data = dict(row)
+        lists[row['event_type']].append(row_data)
     return {"request_date": target_date.isoformat(), "total_registrations": len(rows), "lists": lists}
 
 def clear_future_registrations() -> int:
@@ -215,10 +215,15 @@ def wipe_all_data() -> None:
         conn.execute("TRUNCATE TABLE registrations, users RESTART IDENTITY;")
     logger.warning("Admin WIPED ALL DATA from users and registrations tables.")
 
-# --- Вспомогательные функции для бота (create_calendar, show_main_menu - без изменений) ---
+# --- Вспомогательные функции для бота ---
 def create_calendar(year: int, month: int) -> InlineKeyboardMarkup:
     keyboard = []
-    header = f"{calendar.month_name[month]} {year}"
+    # Назва місяця українською
+    uk_month_names = [
+        "", "Січень", "Лютий", "Березень", "Квітень", "Травень", "Червень",
+        "Липень", "Серпень", "Вересень", "Жовтень", "Листопад", "Грудень"
+    ]
+    header = f"{uk_month_names[month]} {year}"
     keyboard.append([InlineKeyboardButton(header, callback_data='ignore')])
     days = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
     keyboard.append([InlineKeyboardButton(day, callback_data='ignore') for day in days])
@@ -337,17 +342,17 @@ async def date_callback_handler(update: Update, context: CallbackContext) -> int
         
         # Будний день (Пн-Пт)
         if 0 <= day_of_week <= 4:
-            keyboard = [[InlineKeyboardButton('Звичайне (до 21:30)', callback_data='type:Звичайне:21:30')],
+            keyboard = [[InlineKeyboardButton('Звичайне (до 21:30)', callback_data='type:Звичайне')],
                         [InlineKeyboardButton('Добове', callback_data='type:Добове')]]
         # Суббота
         elif day_of_week == 5:
             text = f"Обрана дата: {selected_date:%d.%m.%Y} (Субота).\nВихід о 17:00. Оберіть тип:"
-            keyboard = [[InlineKeyboardButton('Звичайне (до 21:30)', callback_data='type:Звичайне:21:30')],
-                        [InlineKeyboardButton('Добове (до 08:30)', callback_data='type:Добове:08:30:auto')]]
+            keyboard = [[InlineKeyboardButton('Звичайне (до 21:30)', callback_data='type:Звичайне')],
+                        [InlineKeyboardButton('Добове (до 08:30)', callback_data='type:Добове:auto_saturday')]]
         # Воскресенье
         else: # day_of_week == 6
             text = f"Обрана дата: {selected_date:%d.%m.%Y} (Неділя).\nВихід о 09:00. Оберіть тип:"
-            keyboard = [[InlineKeyboardButton('Звичайне (до 21:30)', callback_data='type:Звичайне:21:30')],
+            keyboard = [[InlineKeyboardButton('Звичайне (до 21:30)', callback_data='type:Звичайне')],
                         [InlineKeyboardButton('Добове', callback_data='type:Добове')]]
         
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -361,18 +366,23 @@ async def choose_type(update: Update, context: CallbackContext) -> int:
     event_type = parts[1]
     context.user_data['event_type'] = event_type
     
-    if len(parts) >= 3: # Если информация уже есть (Звичайне или Сб Добове)
-        return_info = f"до {parts[2]}"
-        reason = "рапорт" if len(parts) > 3 else None # Причина для Сб
-        return await save_registration(update, context, reason, return_info)
+    # Обработка простых случаев
+    if event_type == 'Звичайне':
+        return await save_registration(update, context, reason=None, return_info="до 21:30")
+    
+    if len(parts) > 2 and parts[2] == 'auto_saturday': # Автоматический добовой в субботу
+        return await save_registration(update, context, reason="рапорт", return_info="до 08:30")
 
-    if event_type == 'Добове': # Для будних и ВС
+    # Если это Добове в будний день или ВС, задаем следующий вопрос
+    if event_type == 'Добове':
         keyboard = [[InlineKeyboardButton('Рапорт', callback_data='reason:рапорт')],
                     [InlineKeyboardButton('Маю дозвіл Н.І.', callback_data='reason:дозвіл')]]
         await query.edit_message_text("Вкажіть підставу для добового звільнення:", reply_markup=InlineKeyboardMarkup(keyboard))
         return CHOOSE_DOVOBE_REASON
         
-    return await cancel(update, context)
+    # На всякий случай, если что-то пошло не так
+    await query.edit_message_text("Сталася помилка, спробуйте ще раз.")
+    return MAIN_MENU
 
 async def choose_dovobe_reason(update: Update, context: CallbackContext) -> int:
     query = update.callback_query
@@ -383,12 +393,12 @@ async def choose_dovobe_reason(update: Update, context: CallbackContext) -> int:
     context.user_data['reason'] = reason_text
     
     if reason_code == 'рапорт':
-        return await save_registration(update, context, reason_text, "до 06:00")
+        return await save_registration(update, context, reason=reason_text, return_info="до 06:00")
         
     if reason_code == 'дозвіл':
         keyboard = [[InlineKeyboardButton('До 06:00', callback_data='dozvil_time:06:00')],
                     [InlineKeyboardButton('До 08:00', callback_data='dozvil_time:08:00')]]
-        await query.edit_message_text("Ви маєте дозвіл повернутись о 08:00?", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text("Вкажіть, до котрої години ви маєте дозвіл:", reply_markup=InlineKeyboardMarkup(keyboard))
         return CHOOSE_DOZVIL_TIME
 
 async def choose_dozvil_time(update: Update, context: CallbackContext) -> int:
@@ -397,39 +407,39 @@ async def choose_dozvil_time(update: Update, context: CallbackContext) -> int:
     
     return_time = query.data.split(':')[1]
     return_info = f"до {return_time}"
-    return await save_registration(update, context, context.user_data['reason'], return_info)
+    return await save_registration(update, context, reason=context.user_data.get('reason'), return_info=return_info)
 
 async def save_registration(update: Update, context: CallbackContext, reason: str | None, return_info: str) -> int:
     user_id = update.effective_user.id
     selected_date = context.user_data.get('selected_date')
     event_type = context.user_data.get('event_type')
     
+    query = update.callback_query
+
     if not all([selected_date, event_type]):
-        await update.callback_query.edit_message_text("Помилка сесії. Почніть знову з головного меню.")
+        await query.edit_message_text("Помилка сесії. Почніть знову з головного меню.")
+        context.user_data.clear()
         return MAIN_MENU
 
-    success = insert_registration(user_id, event_type, selected_date, reason, return_info)
+    insert_registration(user_id, event_type, selected_date, reason, return_info)
     
     msg = f"✅ Запис оновлено!\n📅 Дата: {selected_date:%d.%m.%Y}\n📋 Тип: {event_type}\n"
     if reason:
         msg += f"📝 Підстава: {reason}\n"
     msg += f"⏰ Повернення: {return_info}"
     
-    await update.callback_query.edit_message_text(msg)
+    await query.edit_message_text(msg)
     context.user_data.clear()
     return MAIN_MENU
 
 # --- Конец новой логики ---
 
-# --- Обработчики редактирования и отмены (без изменений) ---
 async def edit_start(update: Update, context: CallbackContext) -> int:
-    # ... (код без изменений)
     if update.effective_user.id not in ADMIN_IDS: return ConversationHandler.END
     await update.message.reply_text("Введіть Telegram ID користувача, дані якого потрібно змінити.")
     return EDIT_GET_ID
 
 async def edit_get_id(update: Update, context: CallbackContext) -> int:
-    # ... (код без изменений)
     try: target_id = int(update.message.text)
     except ValueError:
         await update.message.reply_text("ID має бути числом. Спробуйте ще раз.")
@@ -445,7 +455,6 @@ async def edit_get_id(update: Update, context: CallbackContext) -> int:
     return EDIT_CHOOSE_FIELD
 
 async def edit_choose_field(update: Update, context: CallbackContext) -> int:
-    # ... (код без изменений)
     query = update.callback_query
     await query.answer()
     field = query.data.split(':')[1]
@@ -455,7 +464,6 @@ async def edit_choose_field(update: Update, context: CallbackContext) -> int:
     return EDIT_GET_NEW_VALUE
 
 async def edit_get_new_value(update: Update, context: CallbackContext) -> int:
-    # ... (код без изменений)
     user_id = context.user_data.get('edit_user_id')
     field = context.user_data.get('edit_field')
     new_value = update.message.text.strip()
@@ -469,17 +477,25 @@ async def edit_get_new_value(update: Update, context: CallbackContext) -> int:
     return ConversationHandler.END
 
 async def cancel(update: Update, context: CallbackContext) -> int:
-    # ... (код без изменений)
-    await update.message.reply_text("Дію скасовано.", reply_markup=ReplyKeyboardRemove())
+    # Определяем, было ли это сообщение или нажатие кнопки
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text("Дію скасовано.")
+    elif update.message:
+        await update.message.reply_text("Дію скасовано.", reply_markup=ReplyKeyboardRemove())
+    
     context.user_data.clear()
     if get_user(update.effective_user.id):
-        await show_main_menu(update, context)
+        # Отправляем новое сообщение с главной клавиатурой
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Головне меню:",
+            reply_markup=ReplyKeyboardMarkup([['Записатись на звільнення', 'Мої записи']], resize_keyboard=True)
+        )
         return MAIN_MENU
     return ConversationHandler.END
 
-# --- Обработчики вне диалога (без изменений) ---
 async def cancel_registration(update: Update, context: CallbackContext):
-    # ... (код без изменений)
     query = update.callback_query
     await query.answer()
     reg_id = int(query.data.split(':')[1])
@@ -487,13 +503,11 @@ async def cancel_registration(update: Update, context: CallbackContext):
     await query.edit_message_text('✅ Запис скасовано.')
 
 async def admin_panel(update: Update, context: CallbackContext):
-    # ... (код без изменений)
     if update.effective_user.id not in ADMIN_IDS: return
     keyboard = [[InlineKeyboardButton("Видалити всі майбутні записи", callback_data='admin:clear_regs')], [InlineKeyboardButton("⚠️ ОЧИСТИТИ ВСІ ДАНІ ⚠️", callback_data='admin:wipe_all')], [InlineKeyboardButton("Скасувати", callback_data='admin:cancel')]]
     await update.message.reply_text("Панель адміністратора:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def admin_panel_callback(update: Update, context: CallbackContext):
-    # ... (код без изменений)
     query = update.callback_query
     await query.answer()
     action = query.data.split(':')[1]
@@ -555,10 +569,9 @@ application.add_handler(CommandHandler('admin', admin_panel))
 application.add_handler(CallbackQueryHandler(admin_panel_callback, pattern='^admin:'))
 application.add_handler(CallbackQueryHandler(ignore_callback, pattern='^ignore$'))
 
-# --- Роуты FastAPI (без изменений) ---
+# --- Роуты FastAPI ---
 @app.post(WEBHOOK_PATH)
 async def process_update(request: Request):
-    # ... (код без изменений)
     update_data = await request.json()
     update = Update.de_json(update_data, application.bot)
     await application.process_update(update)
@@ -566,7 +579,6 @@ async def process_update(request: Request):
 
 @app.get("/api/lists/{date_str}")
 async def get_lists_api(date_str: str, x_api_key: str = Header(None)):
-    # ... (код без изменений)
     if x_api_key != API_KEY:
         raise HTTPException(status_code=403, detail="Forbidden: Invalid API Key")
     try:
@@ -577,9 +589,9 @@ async def get_lists_api(date_str: str, x_api_key: str = Header(None)):
 
 @app.get("/constructor", response_class=HTMLResponse)
 async def get_constructor_page():
-    # ... (код без изменений)
     try:
-        with open("constructor.html", "r", encoding="utf-8") as f:
+        # Указываем правильный путь к файлу
+        with open("ai_studio_code (22).html", "r", encoding="utf-8") as f:
             html_content = f.read()
         return HTMLResponse(content=html_content)
     except FileNotFoundError:
