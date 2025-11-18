@@ -566,8 +566,8 @@ conv_handler = ConversationHandler(
         REG_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_name)],
         REG_GROUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_group)],
         MAIN_MENU: [
-            MessageHandler(filters.Regex('^Записатись на звільнення), handle_menu_choice),
-            MessageHandler(filters.Regex('^Мої записи), handle_menu_choice),
+            MessageHandler(filters.Regex('^Записатись на звільнення'), handle_menu_choice),
+            MessageHandler(filters.Regex('^Мої записи'), handle_menu_choice),
         ],
         CHOOSE_DATE: [CallbackQueryHandler(date_callback_handler, pattern='^(day:|nav:|calendar)')],
         CHOOSE_TYPE: [CallbackQueryHandler(choose_type, pattern='^type:')],
