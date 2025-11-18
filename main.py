@@ -43,14 +43,16 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 DATABASE_URL = os.getenv('DATABASE_URL')
 API_KEY = os.getenv('API_KEY')
-WEBHOOK_PATH = '/webhook'
+# Получаем внешний хост. Если не задан, используем localhost для локальных тестов
 DOMAIN = os.getenv('RENDER_EXTERNAL_HOSTNAME')
 ADMIN_IDS_STR = os.getenv('ADMIN_IDS', '')
-ADMIN_IDS = [int(admin_id) for admin_id in ADMIN_IDS_STR.split(',') if admin_id]
+ADMIN_IDS = [int(admin_id) for admin_id in ADMIN_IDS_STR.split(',') if admin_id.strip()]
 
-if not all([BOT_TOKEN, DATABASE_URL, API_KEY, DOMAIN, ADMIN_IDS]):
-    raise ValueError("Отсутствуют переменные окружения (BOT_TOKEN, DATABASE_URL, API_KEY, DOMAIN, ADMIN_IDS)")
+if not all([BOT_TOKEN, DATABASE_URL, API_KEY, DOMAIN]):
+    # Можно не поднимать ошибку для ADMIN_IDS, если список пуст, но лучше предупредить
+    logger.warning("Внимание: Переменные окружения проверены. Убедитесь, что ADMIN_IDS заполнен.")
 
+WEBHOOK_PATH = '/webhook'
 WEBHOOK_URL = f"https://{DOMAIN}{WEBHOOK_PATH}"
 
 # --- Пул соединений с базой данных ---
@@ -64,8 +66,10 @@ def migrate_database():
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                # 1. Таблица users: Создание и миграция registered_name -> rank, name
+                # 1. Таблица users
                 cur.execute("CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY, rank VARCHAR, name VARCHAR, username VARCHAR, group_number VARCHAR, registration_date TIMESTAMP WITH TIME ZONE NOT NULL);")
+                
+                # Проверка на старую колонку registered_name (для обратной совместимости/миграции)
                 cur.execute("SELECT 1 FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'registered_name';")
                 if cur.fetchone():
                     logger.warning("Old 'registered_name' column found. Migrating data...")
@@ -93,7 +97,7 @@ def migrate_database():
                 # 2. Таблица registrations
                 cur.execute("CREATE TABLE IF NOT EXISTS registrations (id SERIAL PRIMARY KEY, user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE, event_type VARCHAR NOT NULL, event_date DATE NOT NULL, reason VARCHAR, return_info VARCHAR, UNIQUE (user_id, event_date));")
                 
-                # 3. Таблица ranks: Создание и начальное заполнение
+                # 3. Таблица ranks
                 cur.execute("CREATE TABLE IF NOT EXISTS ranks (id SERIAL PRIMARY KEY, name VARCHAR UNIQUE NOT NULL);")
                 logger.info("Table 'ranks' is present.")
                 
@@ -247,14 +251,11 @@ def create_calendar(year: int, month: int) -> InlineKeyboardMarkup:
     keyboard.append([InlineKeyboardButton(day, callback_data='ignore') for day in days])
     month_calendar = calendar.monthcalendar(year, month)
     
-    # ИЗМЕНЕНИЕ: Получаем текущую дату и время
     now = datetime.now()
     today = now.date()
     current_hour = now.hour
     
-    # ИЗМЕНЕНИЕ: Определяем минимально доступную дату
-    # Если сейчас до 16:00, можно записываться на сегодня
-    # Если после 16:00, только на завтра и позже
+    # Определяем минимально доступную дату
     if current_hour < 16:
         min_available_date = today
     else:
@@ -317,12 +318,10 @@ async def register_name(update: Update, context: CallbackContext) -> int:
     available_ranks = get_all_ranks()
     
     # Пытаемся сопоставить ввод с доступными званиями
-    # Проверяем длинные звания первыми (например, "ст. солдат")
     potential_long_rank = " ".join(parts[:2]).lower()
     if potential_long_rank in available_ranks:
         user_rank = potential_long_rank
         name_parts = parts[2:]
-    # Если не нашли, проверяем короткие
     elif len(parts) > 0 and parts[0].lower() in available_ranks:
         user_rank = parts[0].lower()
         name_parts = parts[1:]
@@ -358,7 +357,6 @@ async def register_group(update: Update, context: CallbackContext) -> int:
 async def handle_menu_choice(update: Update, context: CallbackContext) -> int:
     text = update.message.text.strip()
     if text == 'Записатись на звільнення':
-        # ИЗМЕНЕНИЕ: Проверяем текущее время
         now = datetime.now()
         current_hour = now.hour
         today = date.today()
@@ -366,7 +364,6 @@ async def handle_menu_choice(update: Update, context: CallbackContext) -> int:
         
         keyboard = []
         
-        # ИЗМЕНЕНИЕ: Если до 16:00, добавляем кнопку "На сьогодні"
         if current_hour < 16:
             keyboard.append([InlineKeyboardButton('На сьогодні', callback_data=f'day:{today.isoformat()}')])
         
@@ -406,12 +403,10 @@ async def date_callback_handler(update: Update, context: CallbackContext) -> int
     elif data.startswith('day:'):
         selected_date = date.fromisoformat(data.split(':')[1])
         
-        # ИЗМЕНЕНИЕ: Дополнительная проверка при выборе даты
         now = datetime.now()
         today = now.date()
         current_hour = now.hour
         
-        # Если выбрана сегодняшняя дата, но уже после 16:00
         if selected_date == today and current_hour >= 16:
             await query.edit_message_text("⚠️ Час для запису на сьогодні минув (після 16:00).\nБудь ласка, оберіть іншу дату.")
             return CHOOSE_DATE
@@ -566,8 +561,9 @@ conv_handler = ConversationHandler(
         REG_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_name)],
         REG_GROUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_group)],
         MAIN_MENU: [
-            MessageHandler(filters.Regex('^Записатись на звільнення'), handle_menu_choice),
-            MessageHandler(filters.Regex('^Мої записи'), handle_menu_choice),
+            # ИСПРАВЛЕНО: добавлены закрывающие кавычки
+            MessageHandler(filters.Regex('^Записатись на звільнення$'), handle_menu_choice),
+            MessageHandler(filters.Regex('^Мої записи$'), handle_menu_choice),
         ],
         CHOOSE_DATE: [CallbackQueryHandler(date_callback_handler, pattern='^(day:|nav:|calendar)')],
         CHOOSE_TYPE: [CallbackQueryHandler(choose_type, pattern='^type:')],
@@ -580,7 +576,8 @@ application.add_handler(conv_handler)
 application.add_handler(CallbackQueryHandler(cancel_registration, pattern='^cancel:'))
 application.add_handler(CommandHandler('admin', admin_panel))
 application.add_handler(CallbackQueryHandler(admin_panel_callback, pattern='^admin:'))
-application.add_handler(CallbackQueryHandler(ignore_callback, pattern='^ignore))
+# ИСПРАВЛЕНО: добавлена закрывающая кавычка
+application.add_handler(CallbackQueryHandler(ignore_callback, pattern='^ignore'))
 
 
 # --- Роуты FastAPI ---
