@@ -246,7 +246,20 @@ def create_calendar(year: int, month: int) -> InlineKeyboardMarkup:
     days = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
     keyboard.append([InlineKeyboardButton(day, callback_data='ignore') for day in days])
     month_calendar = calendar.monthcalendar(year, month)
-    tomorrow = date.today() + timedelta(days=1)
+    
+    # ИЗМЕНЕНИЕ: Получаем текущую дату и время
+    now = datetime.now()
+    today = now.date()
+    current_hour = now.hour
+    
+    # ИЗМЕНЕНИЕ: Определяем минимально доступную дату
+    # Если сейчас до 16:00, можно записываться на сегодня
+    # Если после 16:00, только на завтра и позже
+    if current_hour < 16:
+        min_available_date = today
+    else:
+        min_available_date = today + timedelta(days=1)
+    
     for week in month_calendar:
         row = []
         for day in week:
@@ -254,7 +267,7 @@ def create_calendar(year: int, month: int) -> InlineKeyboardMarkup:
                 row.append(InlineKeyboardButton(" ", callback_data='ignore'))
             else:
                 current_date = date(year, month, day)
-                if current_date < tomorrow:
+                if current_date < min_available_date:
                     row.append(InlineKeyboardButton(f"~{day}~", callback_data='ignore'))
                 else:
                     row.append(InlineKeyboardButton(str(day), callback_data=f'day:{current_date.isoformat()}'))
@@ -345,11 +358,21 @@ async def register_group(update: Update, context: CallbackContext) -> int:
 async def handle_menu_choice(update: Update, context: CallbackContext) -> int:
     text = update.message.text.strip()
     if text == 'Записатись на звільнення':
-        tomorrow = date.today() + timedelta(days=1)
-        keyboard = [
-            [InlineKeyboardButton('На завтра', callback_data=f'day:{tomorrow.isoformat()}')],
-            [InlineKeyboardButton('Обрати іншу дату', callback_data='calendar')]
-        ]
+        # ИЗМЕНЕНИЕ: Проверяем текущее время
+        now = datetime.now()
+        current_hour = now.hour
+        today = date.today()
+        tomorrow = today + timedelta(days=1)
+        
+        keyboard = []
+        
+        # ИЗМЕНЕНИЕ: Если до 16:00, добавляем кнопку "На сьогодні"
+        if current_hour < 16:
+            keyboard.append([InlineKeyboardButton('На сьогодні', callback_data=f'day:{today.isoformat()}')])
+        
+        keyboard.append([InlineKeyboardButton('На завтра', callback_data=f'day:{tomorrow.isoformat()}')])
+        keyboard.append([InlineKeyboardButton('Обрати іншу дату', callback_data='calendar')])
+        
         await update.message.reply_text('Оберіть дату звільнення:', reply_markup=InlineKeyboardMarkup(keyboard))
         return CHOOSE_DATE
     elif text == 'Мої записи':
@@ -382,6 +405,17 @@ async def date_callback_handler(update: Update, context: CallbackContext) -> int
         return CHOOSE_DATE
     elif data.startswith('day:'):
         selected_date = date.fromisoformat(data.split(':')[1])
+        
+        # ИЗМЕНЕНИЕ: Дополнительная проверка при выборе даты
+        now = datetime.now()
+        today = now.date()
+        current_hour = now.hour
+        
+        # Если выбрана сегодняшняя дата, но уже после 16:00
+        if selected_date == today and current_hour >= 16:
+            await query.edit_message_text("⚠️ Час для запису на сьогодні минув (після 16:00).\nБудь ласка, оберіть іншу дату.")
+            return CHOOSE_DATE
+        
         context.user_data['selected_date'] = selected_date
         day_of_week = selected_date.weekday()
         text = f"Обрана дата: {selected_date:%d.%m.%Y}. Оберіть тип звільнення:"
@@ -532,8 +566,8 @@ conv_handler = ConversationHandler(
         REG_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_name)],
         REG_GROUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_group)],
         MAIN_MENU: [
-            MessageHandler(filters.Regex('^Записатись на звільнення$'), handle_menu_choice),
-            MessageHandler(filters.Regex('^Мої записи$'), handle_menu_choice),
+            MessageHandler(filters.Regex('^Записатись на звільнення), handle_menu_choice),
+            MessageHandler(filters.Regex('^Мої записи), handle_menu_choice),
         ],
         CHOOSE_DATE: [CallbackQueryHandler(date_callback_handler, pattern='^(day:|nav:|calendar)')],
         CHOOSE_TYPE: [CallbackQueryHandler(choose_type, pattern='^type:')],
@@ -546,7 +580,7 @@ application.add_handler(conv_handler)
 application.add_handler(CallbackQueryHandler(cancel_registration, pattern='^cancel:'))
 application.add_handler(CommandHandler('admin', admin_panel))
 application.add_handler(CallbackQueryHandler(admin_panel_callback, pattern='^admin:'))
-application.add_handler(CallbackQueryHandler(ignore_callback, pattern='^ignore$'))
+application.add_handler(CallbackQueryHandler(ignore_callback, pattern='^ignore))
 
 
 # --- Роуты FastAPI ---
