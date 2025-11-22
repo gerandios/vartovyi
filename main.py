@@ -116,12 +116,10 @@ def get_user(user_id: int) -> dict | None:
 def get_all_users() -> list:
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            # Сортуємо по групі, потім по імені
             cur.execute("SELECT user_id, rank, name, group_number FROM users ORDER BY group_number, name")
             return cur.fetchall()
 
 def delete_user_db(user_id: int) -> None:
-    """Видалення користувача з бази даних"""
     with pool.connection() as conn:
         conn.execute("DELETE FROM users WHERE user_id = %s", (user_id,))
 
@@ -210,13 +208,8 @@ def create_calendar(year: int, month: int) -> InlineKeyboardMarkup:
     month_calendar = calendar.monthcalendar(year, month)
     now_kyiv = datetime.now(KYIV_TZ)
     today = now_kyiv.date()
-    current_hour = now_kyiv.hour
     
-    if current_hour < 16:
-        min_available_date = today
-    else:
-        min_available_date = today + timedelta(days=1)
-    
+    # Відображаємо всі дні, а перевірку доступності робимо при кліку
     for week in month_calendar:
         row = []
         for day in week:
@@ -224,7 +217,7 @@ def create_calendar(year: int, month: int) -> InlineKeyboardMarkup:
                 row.append(InlineKeyboardButton(" ", callback_data='ignore'))
             else:
                 current_date = date(year, month, day)
-                if current_date < min_available_date:
+                if current_date < today:
                     row.append(InlineKeyboardButton(f"~{day}~", callback_data='ignore'))
                 else:
                     row.append(InlineKeyboardButton(str(day), callback_data=f'day:{current_date.isoformat()}'))
@@ -240,8 +233,21 @@ def create_calendar(year: int, month: int) -> InlineKeyboardMarkup:
 
 async def show_main_menu(update: Update, context: CallbackContext):
     keyboard = [['Записатись на звільнення', 'Мої записи']]
-    await update.message.reply_text('Головне меню:', reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
-
+    
+    # Текст з ПРАВИЛАМИ
+    info_text = (
+        "🏠 **Головне меню**\n\n"
+        "📜 **ГРАФІК ПОДАЧІ ЗАЯВОК:**\n\n"
+        "1️⃣ **На сьогодні:** до 16:00.\n"
+        "2️⃣ **На Пт, Сб, Нд:** до 17:00 Четверга.\n\n"
+        "⚠️ _Якщо ви намагаєтесь записатись на вихідні у четвер після 17:00 — система вас не пропустить._"
+    )
+    
+    await update.message.reply_text(
+        info_text, 
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
+        parse_mode='Markdown'
+    )
 
 # --- ЛОГІКА РЕЄСТРАЦІЇ ---
 
@@ -250,7 +256,17 @@ async def start_router(update: Update, context: CallbackContext) -> int:
     context.user_data.clear()
     user = get_user(user_id)
     if user:
-        await update.message.reply_text(f"Вітаю, {user['rank']} {user['name']}!", reply_markup=ReplyKeyboardMarkup([['Записатись на звільнення', 'Мої записи']], resize_keyboard=True))
+        info_text = (
+            f"Вітаю, {user['rank']} {user['name']}!\n\n"
+            "📜 **ГРАФІК ПОДАЧІ ЗАЯВОК:**\n"
+            "1️⃣ **На сьогодні:** до 16:00.\n"
+            "2️⃣ **На Пт, Сб, Нд:** до 17:00 Четверга."
+        )
+        await update.message.reply_text(
+            info_text, 
+            reply_markup=ReplyKeyboardMarkup([['Записатись на звільнення', 'Мої записи']], resize_keyboard=True),
+            parse_mode='Markdown'
+        )
         return MAIN_MENU
     else:
         ranks = get_all_ranks()
@@ -284,7 +300,6 @@ async def register_surname(update: Update, context: CallbackContext) -> int:
     await update.message.reply_text("✅ Прізвище прийнято.\n\n3️⃣ **Крок 3 з 4:**\nВведіть ваше **ІМ'Я** або **ІНІЦІАЛИ**.\n📌 *Приклад:* Тарас або Т.Г.", parse_mode='Markdown')
     return REG_FIRSTNAME
 
-# --- ЗМІНА ЛОГІКИ ЗБЕРЕЖЕННЯ ІМЕНІ ---
 async def register_firstname(update: Update, context: CallbackContext) -> int:
     raw_text = update.message.text.strip()
     if len(raw_text) < 1 or (re.match(r"^[\d\s\W]+$", raw_text) and not re.search(r"[a-zA-Zа-яА-Я]", raw_text)):
@@ -293,7 +308,7 @@ async def register_firstname(update: Update, context: CallbackContext) -> int:
 
     surname = context.user_data['surname']
     
-    # ФОРМАТ: "І. Прізвище" (Перша літера імені + крапка + прізвище)
+    # ФОРМАТ: "І. Прізвище"
     initial = raw_text[0].upper()
     full_name = f"{initial}. {surname}"
     
@@ -327,12 +342,11 @@ async def handle_menu_choice(update: Update, context: CallbackContext) -> int:
     text = update.message.text.strip()
     if text == 'Записатись на звільнення':
         now_kyiv = datetime.now(KYIV_TZ)
-        current_hour = now_kyiv.hour
         today = now_kyiv.date()
         tomorrow = today + timedelta(days=1)
         keyboard = []
-        if current_hour < 16:
-            keyboard.append([InlineKeyboardButton('На сьогодні', callback_data=f'day:{today.isoformat()}')])
+        # Кнопки для зручності. Логіка перевірки часу тепер в callback_handler
+        keyboard.append([InlineKeyboardButton('На сьогодні', callback_data=f'day:{today.isoformat()}')])
         keyboard.append([InlineKeyboardButton('На завтра', callback_data=f'day:{tomorrow.isoformat()}')])
         keyboard.append([InlineKeyboardButton('Обрати іншу дату', callback_data='calendar')])
         await update.message.reply_text('Оберіть дату:', reply_markup=InlineKeyboardMarkup(keyboard))
@@ -350,28 +364,87 @@ async def handle_menu_choice(update: Update, context: CallbackContext) -> int:
         return MAIN_MENU
     return MAIN_MENU
 
+# ----------------------------------------------------------------
+# 🔥 ГОЛОВНА ЛОГІКА ПЕРЕВІРКИ ДАТИ І ЧАСУ
+# ----------------------------------------------------------------
 async def date_callback_handler(update: Update, context: CallbackContext) -> int:
     query = update.callback_query
-    await query.answer()
+    # Не робимо query.answer() одразу, щоб мати змогу показати Alert
+    
     data = query.data
+    now = datetime.now(KYIV_TZ)
+
+    # --- НАВИГАЦІЯ ПО КАЛЕНДАРЮ ---
     if data == 'calendar':
-        now = datetime.now(KYIV_TZ)
+        await query.answer()
         await query.edit_message_text("Оберіть дату:", reply_markup=create_calendar(now.year, now.month))
         return CHOOSE_DATE
     elif data.startswith('nav:'):
+        await query.answer()
         _, year, month = data.split(':')
         await query.edit_message_text("Оберіть дату:", reply_markup=create_calendar(int(year), int(month)))
         return CHOOSE_DATE
+    
+    # --- ВИБІР ДАТИ ---
     elif data.startswith('day:'):
         selected_date = date.fromisoformat(data.split(':')[1])
-        now = datetime.now(KYIV_TZ)
-        if selected_date == now.date() and now.hour >= 16:
-            await query.edit_message_text("⚠️ Час на сьогодні вичерпано.")
+        
+        # 1. НЕ МОЖНА В МИНУЛЕ
+        if selected_date < now.date():
+            await query.answer("⚠️ Не можна обрати минулу дату.", show_alert=True)
             return CHOOSE_DATE
+            
+        # 2. ПРАВИЛО "НА СЬОГОДНЯ"
+        # Якщо обрана дата = сьогодні, перевіряємо 16:00
+        if selected_date == now.date():
+            if now.hour >= 16:
+                 await query.answer(
+                     "⛔️ ЗАПИС НА СЬОГОДНІ ЗАЧИНЕНО!\n\n"
+                     "Подавати заявку «день у день» можна лише до 16:00.", 
+                     show_alert=True
+                 )
+                 return CHOOSE_DATE
+
+        # 3. ПРАВИЛО "НА ВИХІДНІ" (Пт, Сб, Нд)
+        # Дедлайн: Четверг 17:00
+        target_dow = selected_date.weekday() # 0=Пн, ..., 3=Чт, 4=Пт, 5=Сб, 6=Нд
+        
+        if target_dow in [4, 5, 6]: # Якщо обрали Пт, Сб або Нд
+            # Знаходимо дату Четверга цього тижня
+            # (Віднімаємо різницю днів, щоб потрапити в день №3 - Четверг)
+            days_diff = target_dow - 3
+            deadline_date = selected_date - timedelta(days=days_diff)
+            
+            # Встановлюємо дедлайн: Четверг 17:00:00
+            deadline_dt = datetime(
+                deadline_date.year, 
+                deadline_date.month, 
+                deadline_date.day, 
+                17, 0, 0, 
+                tzinfo=KYIV_TZ
+            )
+            
+            # Якщо зараз часу більше, ніж дедлайн -> БЛОК
+            if now > deadline_dt:
+                error_text = (
+                    "⛔️ ЗАПИС НА ВИХІДНІ ЗАЧИНЕНО!\n\n"
+                    "Згідно правил, списки на Пт, Сб, Нд закриваються "
+                    "автоматично у ЧЕТВЕР о 17:00.\n\n"
+                    "Ви не встигли."
+                )
+                await query.answer(error_text, show_alert=True)
+                return CHOOSE_DATE
+
+        # --- ЯКЩО ВСЕ ОК ---
+        await query.answer()
         context.user_data['selected_date'] = selected_date
-        dow = selected_date.weekday()
-        if dow == 5: keyboard = [[InlineKeyboardButton('Звичайне', callback_data='type:Звичайне'), InlineKeyboardButton('Добове (до 08:30)', callback_data='type:Добове:auto_saturday')]]
-        else: keyboard = [[InlineKeyboardButton('Звичайне', callback_data='type:Звичайне'), InlineKeyboardButton('Добове', callback_data='type:Добове')]]
+        
+        # Формування кнопок типу звільнення
+        if target_dow == 5: # Субота
+            keyboard = [[InlineKeyboardButton('Звичайне', callback_data='type:Звичайне'), InlineKeyboardButton('Добове (до 08:30)', callback_data='type:Добове:auto_saturday')]]
+        else: 
+            keyboard = [[InlineKeyboardButton('Звичайне', callback_data='type:Звичайне'), InlineKeyboardButton('Добове', callback_data='type:Добове')]]
+        
         await query.edit_message_text(f"Дата: {selected_date:%d.%m.%Y}. Тип звільнення:", reply_markup=InlineKeyboardMarkup(keyboard))
         return CHOOSE_TYPE
 
@@ -434,14 +507,12 @@ async def admin_panel_callback(update: Update, context: CallbackContext):
     query = update.callback_query
     await query.answer()
     
-    # Перевірка прав (на випадок пересилання повідомлення)
     if query.from_user.id not in ADMIN_IDS:
         await query.edit_message_text("⛔️ Доступ заборонено.")
         return
 
     data = query.data
     
-    # 1. Головне меню адмінки
     if data == 'admin:main':
         keyboard = [
             [InlineKeyboardButton("👥 Керування користувачами", callback_data='admin:users_list')],
@@ -451,33 +522,24 @@ async def admin_panel_callback(update: Update, context: CallbackContext):
         ]
         await query.edit_message_text("Адмін-панель:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-    # 2. Список користувачів
     elif data == 'admin:users_list':
         users = get_all_users()
         keyboard = []
         if not users:
             await query.edit_message_text("Список користувачів порожній.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='admin:main')]]))
             return
-            
-        # Ліміт кнопок в Телеграм - близько 100. Якщо буде більше, треба робити пагінацію.
-        # Поки робимо простий список.
         for u in users:
-            # Кнопка: "311 Солдат Т. Шевченко"
             btn_text = f"{u['group_number']} | {u['rank']} {u['name']}"
-            # callback: перехід до дій з конкретним юзером
             keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"admin:u_act:{u['user_id']}")])
-        
         keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='admin:main')])
         await query.edit_message_text("Оберіть користувача для редагування:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-    # 3. Меню дій з користувачем
     elif data.startswith('admin:u_act:'):
         user_id = int(data.split(':')[2])
         user = get_user(user_id)
         if not user:
             await query.edit_message_text("Користувача не знайдено (можливо, вже видалений).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 До списку", callback_data='admin:users_list')]]))
             return
-            
         text = (
             f"👤 **Користувач:**\n"
             f"Звання: {user['rank']}\n"
@@ -492,22 +554,16 @@ async def admin_panel_callback(update: Update, context: CallbackContext):
         ]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
-    # 4. Видалення користувача
     elif data.startswith('admin:u_del:'):
         user_id = int(data.split(':')[2])
         delete_user_db(user_id)
         await query.answer("Користувача видалено!", show_alert=True)
-        # Повертаємось до списку
-        await admin_panel_callback(update, context) # Recursion trick to refresh list? Better explicitly call list logic.
-        # Просто симулюємо натискання кнопки "список"
         query.data = 'admin:users_list'
         await admin_panel_callback(update, context)
 
-    # 5. Редагування (Поки тільки повідомлення)
     elif data.startswith('admin:u_edit:'):
         await query.answer("⚠️ Функція редагування через бот тимчасово недоступна.\nВидаліть користувача та скажіть йому зареєструватися наново, або використайте API.", show_alert=True)
 
-    # Інші дії
     elif data == 'admin:clear_regs':
         count = clear_future_registrations()
         await query.edit_message_text(f"✅ Видалено {count} записів.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='admin:main')]]))
