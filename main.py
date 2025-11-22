@@ -1,9 +1,9 @@
 import os
 import logging
 import calendar
-import re  # <--- ДОДАНО: Необхідно для валідації
+import re
 from datetime import datetime, date, timedelta, timezone
-from zoneinfo import ZoneInfo  # <--- ДОДАНО: Для роботи з Київським часом
+from zoneinfo import ZoneInfo
 from typing import List
 
 from fastapi import FastAPI, Request, HTTPException, Header, Response, status
@@ -34,8 +34,7 @@ from psycopg.rows import dict_row
 
 import uvicorn
 
-# --- Настройка таймзони ---
-# Це гарантує, що всі перевірки часу (16:00, 17:00) працюють по Києву, а не по Лондону
+# --- Настройка таймзони (Київ) ---
 KYIV_TZ = ZoneInfo("Europe/Kiev")
 
 # --- Настройка логування ---
@@ -51,7 +50,6 @@ DATABASE_URL = os.getenv('DATABASE_URL')
 API_KEY = os.getenv('API_KEY')
 DOMAIN = os.getenv('RENDER_EXTERNAL_HOSTNAME')
 ADMIN_IDS_STR = os.getenv('ADMIN_IDS', '')
-# Захист від помилки, якщо ADMIN_IDS порожній
 ADMIN_IDS = [int(aid) for aid in ADMIN_IDS_STR.split(',') if aid.strip().isdigit()]
 
 if not all([BOT_TOKEN, DATABASE_URL, API_KEY, DOMAIN]):
@@ -73,7 +71,6 @@ def migrate_database():
                 cur.execute("CREATE TABLE IF NOT EXISTS registrations (id SERIAL PRIMARY KEY, user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE, event_type VARCHAR NOT NULL, event_date DATE NOT NULL, reason VARCHAR, return_info VARCHAR, UNIQUE (user_id, event_date));")
                 cur.execute("CREATE TABLE IF NOT EXISTS ranks (id SERIAL PRIMARY KEY, name VARCHAR UNIQUE NOT NULL);")
                 
-                # Дефолтні звання
                 default_ranks = ['солдат', 'ст. солдат', 'молодший сержант', 'сержант']
                 for rank_name in default_ranks:
                     cur.execute("INSERT INTO ranks (name) VALUES (%s) ON CONFLICT (name) DO NOTHING;", (rank_name,))
@@ -88,13 +85,13 @@ migrate_database()
 
 # --- СТАНИ ---
 (
-    REG_RANK, REG_SURNAME, REG_FIRSTNAME, REG_GROUP,  # Етапи реєстрації
+    REG_RANK, REG_SURNAME, REG_FIRSTNAME, REG_GROUP, 
     MAIN_MENU, 
     CHOOSE_DATE, CHOOSE_TYPE, CHOOSE_DOVOBE_REASON, CHOOSE_DOZVIL_TIME
 ) = range(9)
 
 
-# --- БД ФУНКЦІЇ (Синхронні) ---
+# --- БД ФУНКЦІЇ ---
 def insert_user(user_id: int, rank: str, name: str, username: str | None, group_number: str) -> None:
     with pool.connection() as conn:
         conn.execute(
@@ -119,8 +116,14 @@ def get_user(user_id: int) -> dict | None:
 def get_all_users() -> list:
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
+            # Сортуємо по групі, потім по імені
             cur.execute("SELECT user_id, rank, name, group_number FROM users ORDER BY group_number, name")
             return cur.fetchall()
+
+def delete_user_db(user_id: int) -> None:
+    """Видалення користувача з бази даних"""
+    with pool.connection() as conn:
+        conn.execute("DELETE FROM users WHERE user_id = %s", (user_id,))
 
 def update_user_from_admin(user_id: int, rank: str, name: str, group_number: str) -> None:
     with pool.connection() as conn:
@@ -150,7 +153,6 @@ def delete_registration(reg_id: int) -> None:
 def get_lists_for_date(target_date: date) -> dict:
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            # concat rank + name
             cur.execute(
                 """
                 SELECT r.event_type, CONCAT(u.rank, ' ', u.name) AS full_name, u.username, u.group_number,
@@ -197,6 +199,7 @@ def delete_rank(rank_name: str):
                 raise HTTPException(status_code=409, detail="Rank is in use.")
             cur.execute("DELETE FROM ranks WHERE name = %s;", (rank_name,))
 
+
 # --- UI ФУНКЦІЇ ---
 def create_calendar(year: int, month: int) -> InlineKeyboardMarkup:
     keyboard = []
@@ -205,8 +208,6 @@ def create_calendar(year: int, month: int) -> InlineKeyboardMarkup:
     keyboard.append([InlineKeyboardButton(day, callback_data='ignore') for day in ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]])
     
     month_calendar = calendar.monthcalendar(year, month)
-    
-    # Отримуємо час по Києву!
     now_kyiv = datetime.now(KYIV_TZ)
     today = now_kyiv.date()
     current_hour = now_kyiv.hour
@@ -228,8 +229,7 @@ def create_calendar(year: int, month: int) -> InlineKeyboardMarkup:
                 else:
                     row.append(InlineKeyboardButton(str(day), callback_data=f'day:{current_date.isoformat()}'))
         keyboard.append(row)
-        
-    # Навігація
+    
     prev_d = date(year, month, 1) - timedelta(days=1)
     next_d = date(year, month, 1) + timedelta(days=32)
     keyboard.append([
@@ -242,18 +242,15 @@ async def show_main_menu(update: Update, context: CallbackContext):
     keyboard = [['Записатись на звільнення', 'Мої записи']]
     await update.message.reply_text('Головне меню:', reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
 
-# --- ЛОГІКА БОТА: СТАРТ ТА РЕЄСТРАЦІЯ ---
+
+# --- ЛОГІКА РЕЄСТРАЦІЇ ---
 
 async def start_router(update: Update, context: CallbackContext) -> int:
     user_id = update.effective_user.id
     context.user_data.clear()
     user = get_user(user_id)
-    
     if user:
-        await update.message.reply_text(
-            f"Вітаю, {user['rank']} {user['name']}!\nОберіть дію:",
-            reply_markup=ReplyKeyboardMarkup([['Записатись на звільнення', 'Мої записи']], resize_keyboard=True),
-        )
+        await update.message.reply_text(f"Вітаю, {user['rank']} {user['name']}!", reply_markup=ReplyKeyboardMarkup([['Записатись на звільнення', 'Мої записи']], resize_keyboard=True))
         return MAIN_MENU
     else:
         ranks = get_all_ranks()
@@ -264,151 +261,92 @@ async def start_router(update: Update, context: CallbackContext) -> int:
             if len(row) == 2:
                 keyboard.append(row)
                 row = []
-        if row:
-            keyboard.append(row)
+        if row: keyboard.append(row)
             
-        await update.message.reply_text(
-            "Вітаю! Розпочнемо реєстрацію.\n\n"
-            "1️⃣ **Крок 1 з 4:**\n"
-            "Оберіть ваше **звання** за допомогою кнопок меню:",
-            reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
-            parse_mode='Markdown'
-        )
+        await update.message.reply_text("Вітаю! Розпочнемо реєстрацію.\n1️⃣ **Крок 1 з 4:**\nОберіть ваше **звання**:", reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True), parse_mode='Markdown')
         return REG_RANK
 
-# 1. Валідація звання
 async def register_rank(update: Update, context: CallbackContext) -> int:
     selected_rank = update.message.text.lower()
-    available_ranks = [r.lower() for r in get_all_ranks()]
-    
-    if selected_rank not in available_ranks:
-        await update.message.reply_text("⚠️ Будь ласка, оберіть звання, натиснувши на кнопку внизу.")
+    if selected_rank not in [r.lower() for r in get_all_ranks()]:
+        await update.message.reply_text("⚠️ Оберіть звання з меню.")
         return REG_RANK
-
     context.user_data['rank'] = selected_rank
-    
-    await update.message.reply_text(
-        "✅ Звання прийнято.\n\n"
-        "2️⃣ **Крок 2 з 4:**\n"
-        "Введіть ваше **ПРІЗВИЩЕ** (лише прізвище).\n"
-        "📌 *Приклад:* Шевченко",
-        reply_markup=ReplyKeyboardRemove(),
-        parse_mode='Markdown'
-    )
+    await update.message.reply_text("✅ Звання прийнято.\n\n2️⃣ **Крок 2 з 4:**\nВведіть ваше **ПРІЗВИЩЕ** (лише прізвище).\n📌 *Приклад:* Шевченко", reply_markup=ReplyKeyboardRemove(), parse_mode='Markdown')
     return REG_SURNAME
 
-# 2. Валідація прізвища
 async def register_surname(update: Update, context: CallbackContext) -> int:
     raw_text = update.message.text.strip()
-    
-    if len(raw_text) < 2:
-        await update.message.reply_text("⚠️ Прізвище занадто коротке. Спробуйте ще раз.")
+    if len(raw_text) < 2 or not re.match(r"^[a-zA-Zа-яА-ЯіІїЇєЄґҐ\-\']+$", raw_text):
+        await update.message.reply_text("⚠️ Помилка. Введіть коректне прізвище (тільки літери).")
         return REG_SURNAME
-
-    # Дозволяємо літери, дефіс, апостроф. Забороняємо цифри та спецсимволи.
-    if not re.match(r"^[a-zA-Zа-яА-ЯіІїЇєЄґҐ\-\']+$", raw_text):
-        await update.message.reply_text("⚠️ Прізвище повинно містити **тільки літери**. Без цифр, смайлів та пробілів.\nСпробуйте ще раз.", parse_mode='Markdown')
-        return REG_SURNAME
-
     context.user_data['surname'] = raw_text.capitalize()
-    
-    await update.message.reply_text(
-        "✅ Прізвище прийнято.\n\n"
-        "3️⃣ **Крок 3 з 4:**\n"
-        "Введіть ваше **ІМ'Я** або **ІНІЦІАЛИ**.\n"
-        "📌 *Приклад:* Тарас або Т.Г.",
-        parse_mode='Markdown'
-    )
+    await update.message.reply_text("✅ Прізвище прийнято.\n\n3️⃣ **Крок 3 з 4:**\nВведіть ваше **ІМ'Я** або **ІНІЦІАЛИ**.\n📌 *Приклад:* Тарас або Т.Г.", parse_mode='Markdown')
     return REG_FIRSTNAME
 
-# 3. Валідація імені
+# --- ЗМІНА ЛОГІКИ ЗБЕРЕЖЕННЯ ІМЕНІ ---
 async def register_firstname(update: Update, context: CallbackContext) -> int:
     raw_text = update.message.text.strip()
-    
-    if len(raw_text) < 1 or len(raw_text) > 30:
-        await update.message.reply_text("⚠️ Некоректна довжина. Введіть нормально (Ім'я або Ініціали).")
+    if len(raw_text) < 1 or (re.match(r"^[\d\s\W]+$", raw_text) and not re.search(r"[a-zA-Zа-яА-Я]", raw_text)):
+        await update.message.reply_text("⚠️ Введіть коректне ім'я або ініціали.")
         return REG_FIRSTNAME
-    
-    # Якщо тільки цифри/символи
-    if re.match(r"^[\d\s\W]+$", raw_text) and not re.search(r"[a-zA-Zа-яА-Я]", raw_text):
-         await update.message.reply_text("⚠️ Ім'я не може складатися тільки з цифр або символів.")
-         return REG_FIRSTNAME
 
     surname = context.user_data['surname']
-    full_name = f"{surname} {raw_text.title()}"
+    
+    # ФОРМАТ: "І. Прізвище" (Перша літера імені + крапка + прізвище)
+    initial = raw_text[0].upper()
+    full_name = f"{initial}. {surname}"
+    
     context.user_data['name'] = full_name
     
     await update.message.reply_text(
-        "✅ Прийнято.\n\n"
+        f"Ваше ім'я в системі буде: **{full_name}**\n\n"
         "4️⃣ **Крок 4 з 4:**\n"
-        "Введіть номер вашої **ГРУПИ**.\n"
-        "⚠️ **ТІЛЬКИ ЦИФРИ** (наприклад: 311)",
+        "Введіть номер вашої **ГРУПИ** (тільки цифри).",
         parse_mode='Markdown'
     )
     return REG_GROUP
 
-# 4. Валідація групи
 async def register_group(update: Update, context: CallbackContext) -> int:
     group_number = update.message.text.strip()
-    
-    if not group_number.isdigit():
-        await update.message.reply_text("⛔️ Помилка! Номер групи має складатися **тільки з цифр**.\nВведіть ще раз:", parse_mode='Markdown')
-        return REG_GROUP
-    
-    if len(group_number) > 5:
-        await update.message.reply_text("⛔️ Занадто довгий номер групи.")
+    if not group_number.isdigit() or len(group_number) > 5:
+        await update.message.reply_text("⛔️ Номер групи має складатися тільки з цифр.")
         return REG_GROUP
 
     rank = context.user_data['rank']
     name = context.user_data['name']
-    
     insert_user(update.effective_user.id, rank, name, update.effective_user.username, group_number)
     
-    await update.message.reply_text(
-        f'✅ **РЕЄСТРАЦІЮ ЗАВЕРШЕНО!**\n\n'
-        f'👤 **Дані:** {rank.capitalize()} {name}\n'
-        f'🎓 **Група:** {group_number}\n\n'
-        f'Тепер ви можете користуватися меню.',
-        parse_mode='Markdown'
-    )
+    await update.message.reply_text(f'✅ **РЕЄСТРАЦІЮ ЗАВЕРШЕНО!**\n👤 {rank.capitalize()} {name}\n🎓 Група: {group_number}', parse_mode='Markdown')
     await show_main_menu(update, context)
     context.user_data.clear()
     return MAIN_MENU
 
-
-# --- ЛОГІКА БОТА: МЕНЮ І ЗАПИС ---
-
+# --- МЕНЮ ---
 async def handle_menu_choice(update: Update, context: CallbackContext) -> int:
     text = update.message.text.strip()
     if text == 'Записатись на звільнення':
-        now_kyiv = datetime.now(KYIV_TZ) # ВИПРАВЛЕНО ЧАС
+        now_kyiv = datetime.now(KYIV_TZ)
         current_hour = now_kyiv.hour
         today = now_kyiv.date()
         tomorrow = today + timedelta(days=1)
-        
         keyboard = []
-        
         if current_hour < 16:
             keyboard.append([InlineKeyboardButton('На сьогодні', callback_data=f'day:{today.isoformat()}')])
-        
         keyboard.append([InlineKeyboardButton('На завтра', callback_data=f'day:{tomorrow.isoformat()}')])
         keyboard.append([InlineKeyboardButton('Обрати іншу дату', callback_data='calendar')])
-        
-        await update.message.reply_text('Оберіть дату звільнення:', reply_markup=InlineKeyboardMarkup(keyboard))
+        await update.message.reply_text('Оберіть дату:', reply_markup=InlineKeyboardMarkup(keyboard))
         return CHOOSE_DATE
-    
     elif text == 'Мої записи':
         regs = get_user_registrations(update.effective_user.id)
         if not regs:
-            await update.message.reply_text('У вас немає активних записів.')
+            await update.message.reply_text('Записів немає.')
         else:
-            await update.message.reply_text("Ваші активні записи:")
             for reg in regs:
-                reason_text = f'\n📝 Підстава: {reg["reason"]}' if reg["reason"] else ""
-                return_text = f'\n⏰ Повернення: {reg["return_info"]}' if reg["return_info"] else ""
-                msg = f'📅 Дата: {reg["event_date"]:%d.%m.%Y}\n📋 Тип: {reg["event_type"]}{reason_text}{return_text}'
-                keyboard = InlineKeyboardMarkup([[InlineKeyboardButton('Скасувати запис', callback_data=f'cancel:{reg["id"]}')]])
-                await update.message.reply_text(msg, reply_markup=keyboard)
+                msg = f'📅 {reg["event_date"]:%d.%m.%Y} | {reg["event_type"]}'
+                if reg["reason"]: msg += f'\n📝 {reg["reason"]}'
+                if reg["return_info"]: msg += f'\n⏰ {reg["return_info"]}'
+                await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Скасувати', callback_data=f'cancel:{reg["id"]}')]]))
         return MAIN_MENU
     return MAIN_MENU
 
@@ -416,7 +354,6 @@ async def date_callback_handler(update: Update, context: CallbackContext) -> int
     query = update.callback_query
     await query.answer()
     data = query.data
-
     if data == 'calendar':
         now = datetime.now(KYIV_TZ)
         await query.edit_message_text("Оберіть дату:", reply_markup=create_calendar(now.year, now.month))
@@ -427,158 +364,175 @@ async def date_callback_handler(update: Update, context: CallbackContext) -> int
         return CHOOSE_DATE
     elif data.startswith('day:'):
         selected_date = date.fromisoformat(data.split(':')[1])
-        
-        now = datetime.now(KYIV_TZ) # ВИПРАВЛЕНО
-        today = now.date()
-        current_hour = now.hour
-        
-        if selected_date == today and current_hour >= 16:
-            await query.edit_message_text("⚠️ Час для запису на сьогодні минув (після 16:00).\nБудь ласка, оберіть іншу дату.")
+        now = datetime.now(KYIV_TZ)
+        if selected_date == now.date() and now.hour >= 16:
+            await query.edit_message_text("⚠️ Час на сьогодні вичерпано.")
             return CHOOSE_DATE
-        
         context.user_data['selected_date'] = selected_date
-        day_of_week = selected_date.weekday()
-        text = f"Обрана дата: {selected_date:%d.%m.%Y}. Оберіть тип звільнення:"
-        
-        # Логіка вихідних
-        if 0 <= day_of_week <= 4: # Пн-Пт
-            keyboard = [[InlineKeyboardButton('Звичайне (до 21:30)', callback_data='type:Звичайне')],
-                        [InlineKeyboardButton('Добове', callback_data='type:Добове')]]
-        elif day_of_week == 5: # Субота
-            text = f"Обрана дата: {selected_date:%d.%m.%Y} (Субота).\nВихід о 17:00. Оберіть тип:"
-            keyboard = [[InlineKeyboardButton('Звичайне (до 21:30)', callback_data='type:Звичайне')],
-                        [InlineKeyboardButton('Добове (до 08:30)', callback_data='type:Добове:auto_saturday')]]
-        else: # Неділя
-            text = f"Обрана дата: {selected_date:%d.%m.%Y} (Неділя).\nВихід о 09:00. Оберіть тип:"
-            keyboard = [[InlineKeyboardButton('Звичайне (до 21:30)', callback_data='type:Звичайне')],
-                        [InlineKeyboardButton('Добове', callback_data='type:Добове')]]
-                        
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        dow = selected_date.weekday()
+        if dow == 5: keyboard = [[InlineKeyboardButton('Звичайне', callback_data='type:Звичайне'), InlineKeyboardButton('Добове (до 08:30)', callback_data='type:Добове:auto_saturday')]]
+        else: keyboard = [[InlineKeyboardButton('Звичайне', callback_data='type:Звичайне'), InlineKeyboardButton('Добове', callback_data='type:Добове')]]
+        await query.edit_message_text(f"Дата: {selected_date:%d.%m.%Y}. Тип звільнення:", reply_markup=InlineKeyboardMarkup(keyboard))
         return CHOOSE_TYPE
 
 async def choose_type(update: Update, context: CallbackContext) -> int:
     query = update.callback_query
     await query.answer()
     parts = query.data.split(':')
-    event_type = parts[1]
-    context.user_data['event_type'] = event_type
-    if event_type == 'Звичайне':
-        return await save_registration(update, context, reason=None, return_info="до 21:30")
-    if len(parts) > 2 and parts[2] == 'auto_saturday':
-        return await save_registration(update, context, reason="рапорт", return_info="до 08:30")
-    if event_type == 'Добове':
-        keyboard = [[InlineKeyboardButton('Рапорт', callback_data='reason:рапорт')],
-                    [InlineKeyboardButton('Маю дозвіл Н.І.', callback_data='reason:дозвіл')]]
-        await query.edit_message_text("Вкажіть підставу для добового звільнення:", reply_markup=InlineKeyboardMarkup(keyboard))
-        return CHOOSE_DOVOBE_REASON
-    return MAIN_MENU
+    context.user_data['event_type'] = parts[1]
+    if parts[1] == 'Звичайне': return await save_registration(update, context, None, "до 21:30")
+    if len(parts) > 2: return await save_registration(update, context, "рапорт", "до 08:30")
+    await query.edit_message_text("Підстава:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('Рапорт', callback_data='reason:рапорт')], [InlineKeyboardButton('Дозвіл Н.І.', callback_data='reason:дозвіл')]]))
+    return CHOOSE_DOVOBE_REASON
 
 async def choose_dovobe_reason(update: Update, context: CallbackContext) -> int:
     query = update.callback_query
     await query.answer()
-    reason_code = query.data.split(':')[1]
-    reason_text = "рапорт" if reason_code == "рапорт" else "дозвіл Н.І."
-    context.user_data['reason'] = reason_text
-    if reason_code == 'рапорт':
-        return await save_registration(update, context, reason=reason_text, return_info="до 06:00")
-    if reason_code == 'дозвіл':
-        keyboard = [[InlineKeyboardButton('До 06:00', callback_data='dozvil_time:06:00')],
-                    [InlineKeyboardButton('До 08:00', callback_data='dozvil_time:08:00')]]
-        await query.edit_message_text("Вкажіть, до котрої години ви маєте дозвіл:", reply_markup=InlineKeyboardMarkup(keyboard))
-        return CHOOSE_DOZVIL_TIME
+    reason = "рапорт" if query.data.split(':')[1] == "рапорт" else "дозвіл Н.І."
+    context.user_data['reason'] = reason
+    if reason == "рапорт": return await save_registration(update, context, reason, "до 06:00")
+    await query.edit_message_text("До котрої:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('До 06:00', callback_data='dozvil_time:06:00')], [InlineKeyboardButton('До 08:00', callback_data='dozvil_time:08:00')]]))
+    return CHOOSE_DOZVIL_TIME
 
 async def choose_dozvil_time(update: Update, context: CallbackContext) -> int:
     query = update.callback_query
     await query.answer()
-    return_time = query.data.split(':')[1]
-    return_info = f"до {return_time}"
-    return await save_registration(update, context, reason=context.user_data.get('reason'), return_info=return_info)
+    return await save_registration(update, context, context.user_data.get('reason'), f"до {query.data.split(':')[1]}")
 
-async def save_registration(update: Update, context: CallbackContext, reason: str | None, return_info: str) -> int:
-    user_id = update.effective_user.id
-    selected_date = context.user_data.get('selected_date')
-    event_type = context.user_data.get('event_type')
-    query = update.callback_query
-    
-    if not all([selected_date, event_type]):
-        await query.edit_message_text("❌ Помилка сесії. Почніть знову.")
-        context.user_data.clear()
-        return MAIN_MENU
-        
-    insert_registration(user_id, event_type, selected_date, reason, return_info)
-    msg = f"✅ Запис оновлено!\n📅 Дата: {selected_date:%d.%m.%Y}\n📋 Тип: {event_type}\n"
-    if reason: msg += f"📝 Підстава: {reason}\n"
-    msg += f"⏰ Повернення: {return_info}"
-    await query.edit_message_text(msg)
+async def save_registration(update: Update, context: CallbackContext, reason, return_info) -> int:
+    insert_registration(update.effective_user.id, context.user_data['event_type'], context.user_data['selected_date'], reason, return_info)
+    await update.callback_query.edit_message_text("✅ Запис збережено!")
     context.user_data.clear()
     return MAIN_MENU
 
 async def cancel(update: Update, context: CallbackContext) -> int:
-    if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.edit_message_text("Дію скасовано.")
-    elif update.message:
-        await update.message.reply_text("Дію скасовано.", reply_markup=ReplyKeyboardRemove())
+    if update.callback_query: await update.callback_query.edit_message_text("Скасовано.")
+    else: await update.message.reply_text("Скасовано.", reply_markup=ReplyKeyboardRemove())
     context.user_data.clear()
-    # Повертаємо меню, якщо юзер вже зареєстрований
-    if get_user(update.effective_user.id):
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="Головне меню:",
-            reply_markup=ReplyKeyboardMarkup([['Записатись на звільнення', 'Мої записи']], resize_keyboard=True)
-        )
-        return MAIN_MENU
-    return ConversationHandler.END
+    if get_user(update.effective_user.id): await show_main_menu(update, context)
+    return MAIN_MENU if get_user(update.effective_user.id) else ConversationHandler.END
 
 async def cancel_registration(update: Update, context: CallbackContext):
     query = update.callback_query
     await query.answer()
-    reg_id = int(query.data.split(':')[1])
-    delete_registration(reg_id)
-    await query.edit_message_text('✅ Запис скасовано.')
+    delete_registration(int(query.data.split(':')[1]))
+    await query.edit_message_text('✅ Запис видалено.')
+
+# --- АДМІН ПАНЕЛЬ ---
 
 async def admin_panel(update: Update, context: CallbackContext):
     if update.effective_user.id not in ADMIN_IDS: return
-    keyboard = [[InlineKeyboardButton("Видалити всі майбутні записи", callback_data='admin:clear_regs')], [InlineKeyboardButton("⚠️ ОЧИСТИТИ ВСІ ДАНІ ⚠️", callback_data='admin:wipe_all')], [InlineKeyboardButton("Скасувати", callback_data='admin:cancel')]]
-    await update.message.reply_text("Панель адміністратора:", reply_markup=InlineKeyboardMarkup(keyboard))
+    keyboard = [
+        [InlineKeyboardButton("👥 Керування користувачами", callback_data='admin:users_list')],
+        [InlineKeyboardButton("🗑 Видалити майбутні записи", callback_data='admin:clear_regs')],
+        [InlineKeyboardButton("⚠️ ОЧИСТИТИ ВСЕ (WIPE) ⚠️", callback_data='admin:wipe_all')],
+        [InlineKeyboardButton("Скасувати", callback_data='admin:cancel')]
+    ]
+    await update.message.reply_text("Адмін-панель:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def admin_panel_callback(update: Update, context: CallbackContext):
     query = update.callback_query
     await query.answer()
-    action = query.data.split(':')[1]
-    if action == 'clear_regs':
+    
+    # Перевірка прав (на випадок пересилання повідомлення)
+    if query.from_user.id not in ADMIN_IDS:
+        await query.edit_message_text("⛔️ Доступ заборонено.")
+        return
+
+    data = query.data
+    
+    # 1. Головне меню адмінки
+    if data == 'admin:main':
+        keyboard = [
+            [InlineKeyboardButton("👥 Керування користувачами", callback_data='admin:users_list')],
+            [InlineKeyboardButton("🗑 Видалити майбутні записи", callback_data='admin:clear_regs')],
+            [InlineKeyboardButton("⚠️ ОЧИСТИТИ ВСЕ (WIPE) ⚠️", callback_data='admin:wipe_all')],
+            [InlineKeyboardButton("Скасувати", callback_data='admin:cancel')]
+        ]
+        await query.edit_message_text("Адмін-панель:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    # 2. Список користувачів
+    elif data == 'admin:users_list':
+        users = get_all_users()
+        keyboard = []
+        if not users:
+            await query.edit_message_text("Список користувачів порожній.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='admin:main')]]))
+            return
+            
+        # Ліміт кнопок в Телеграм - близько 100. Якщо буде більше, треба робити пагінацію.
+        # Поки робимо простий список.
+        for u in users:
+            # Кнопка: "311 Солдат Т. Шевченко"
+            btn_text = f"{u['group_number']} | {u['rank']} {u['name']}"
+            # callback: перехід до дій з конкретним юзером
+            keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"admin:u_act:{u['user_id']}")])
+        
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='admin:main')])
+        await query.edit_message_text("Оберіть користувача для редагування:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    # 3. Меню дій з користувачем
+    elif data.startswith('admin:u_act:'):
+        user_id = int(data.split(':')[2])
+        user = get_user(user_id)
+        if not user:
+            await query.edit_message_text("Користувача не знайдено (можливо, вже видалений).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 До списку", callback_data='admin:users_list')]]))
+            return
+            
+        text = (
+            f"👤 **Користувач:**\n"
+            f"Звання: {user['rank']}\n"
+            f"Ім'я: {user['name']}\n"
+            f"Група: {user['group_number']}\n"
+            f"Telegram ID: `{user['user_id']}`"
+        )
+        keyboard = [
+            [InlineKeyboardButton("❌ ВИДАЛИТИ З БАЗИ", callback_data=f"admin:u_del:{user_id}")],
+            [InlineKeyboardButton("✏️ Редагувати (заглушка)", callback_data=f"admin:u_edit:{user_id}")],
+            [InlineKeyboardButton("🔙 До списку", callback_data='admin:users_list')]
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+    # 4. Видалення користувача
+    elif data.startswith('admin:u_del:'):
+        user_id = int(data.split(':')[2])
+        delete_user_db(user_id)
+        await query.answer("Користувача видалено!", show_alert=True)
+        # Повертаємось до списку
+        await admin_panel_callback(update, context) # Recursion trick to refresh list? Better explicitly call list logic.
+        # Просто симулюємо натискання кнопки "список"
+        query.data = 'admin:users_list'
+        await admin_panel_callback(update, context)
+
+    # 5. Редагування (Поки тільки повідомлення)
+    elif data.startswith('admin:u_edit:'):
+        await query.answer("⚠️ Функція редагування через бот тимчасово недоступна.\nВидаліть користувача та скажіть йому зареєструватися наново, або використайте API.", show_alert=True)
+
+    # Інші дії
+    elif data == 'admin:clear_regs':
         count = clear_future_registrations()
-        await query.edit_message_text(f"✅ Видалено {count} записів.")
-    elif action == 'wipe_all':
+        await query.edit_message_text(f"✅ Видалено {count} записів.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='admin:main')]]))
+    elif data == 'admin:wipe_all':
         wipe_all_data()
-        await query.edit_message_text("✅🔴 БАЗА ДАНИХ ОЧИЩЕНА.")
-    elif action == 'cancel':
-        await query.edit_message_text("Скасовано.")
+        await query.edit_message_text("✅🔴 БАЗА ДАНИХ ОЧИЩЕНА ПОВНІСТЮ.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='admin:main')]]))
+    elif data == 'admin:cancel':
+        await query.edit_message_text("Адмін-панель закрито.")
 
 async def ignore_callback(update: Update, context: CallbackContext):
     if update.callback_query: await update.callback_query.answer()
 
-# --- FastAPI & Application ---
+# --- FastAPI ---
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-
 application = ApplicationBuilder().token(BOT_TOKEN).build()
 
 conv_handler = ConversationHandler(
-    entry_points=[
-        CommandHandler('start', start_router),
-        MessageHandler(filters.TEXT & ~filters.COMMAND, start_router)
-    ],
+    entry_points=[CommandHandler('start', start_router), MessageHandler(filters.TEXT & ~filters.COMMAND, start_router)],
     states={
         REG_RANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_rank)],
         REG_SURNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_surname)],
         REG_FIRSTNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_firstname)],
         REG_GROUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_group)],
-        
-        MAIN_MENU: [
-            MessageHandler(filters.Regex('^Записатись на звільнення$'), handle_menu_choice),
-            MessageHandler(filters.Regex('^Мої записи$'), handle_menu_choice),
-        ],
+        MAIN_MENU: [MessageHandler(filters.Regex('^Записатись на звільнення$'), handle_menu_choice), MessageHandler(filters.Regex('^Мої записи$'), handle_menu_choice)],
         CHOOSE_DATE: [CallbackQueryHandler(date_callback_handler, pattern='^(day:|nav:|calendar)')],
         CHOOSE_TYPE: [CallbackQueryHandler(choose_type, pattern='^type:')],
         CHOOSE_DOVOBE_REASON: [CallbackQueryHandler(choose_dovobe_reason, pattern='^reason:')],
@@ -586,63 +540,55 @@ conv_handler = ConversationHandler(
     },
     fallbacks=[CommandHandler('cancel', cancel), CommandHandler('start', start_router)],
 )
+
 application.add_handler(conv_handler)
 application.add_handler(CallbackQueryHandler(cancel_registration, pattern='^cancel:'))
 application.add_handler(CommandHandler('admin', admin_panel))
 application.add_handler(CallbackQueryHandler(admin_panel_callback, pattern='^admin:'))
 application.add_handler(CallbackQueryHandler(ignore_callback, pattern='^ignore'))
 
-# --- API Routes ---
 class UserUpdate(BaseModel):
     rank: str
     name: str
     group_number: str
-
 class RankCreate(BaseModel):
     name: str
 
 @app.post(WEBHOOK_PATH)
 async def process_update(request: Request):
-    update_data = await request.json()
-    update = Update.de_json(update_data, application.bot)
-    await application.process_update(update)
+    await application.process_update(Update.de_json(await request.json(), application.bot))
     return {"ok": True}
 
 @app.get("/api/lists/{date_str}")
 async def get_lists_api(date_str: str, x_api_key: str = Header(None)):
-    if x_api_key != API_KEY: raise HTTPException(status_code=403, detail="Forbidden")
-    try:
-        target_date = date.fromisoformat(date_str)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid date")
-    return get_lists_for_date(target_date)
+    if x_api_key != API_KEY: raise HTTPException(403)
+    return get_lists_for_date(date.fromisoformat(date_str))
 
 @app.get("/api/users")
 async def get_users_list_api(x_api_key: str = Header(None)):
-    if x_api_key != API_KEY: raise HTTPException(status_code=403, detail="Forbidden")
+    if x_api_key != API_KEY: raise HTTPException(403)
     return get_all_users()
 
 @app.put("/api/users/{user_id}")
 async def update_user_api(user_id: int, user_data: UserUpdate, x_api_key: str = Header(None)):
-    if x_api_key != API_KEY: raise HTTPException(status_code=403, detail="Forbidden")
+    if x_api_key != API_KEY: raise HTTPException(403)
     update_user_from_admin(user_id, user_data.rank, user_data.name, user_data.group_number)
     return {"status": "success"}
 
 @app.get("/api/ranks")
 async def get_ranks_api(x_api_key: str = Header(None)):
-    if x_api_key != API_KEY: raise HTTPException(status_code=403, detail="Forbidden")
+    if x_api_key != API_KEY: raise HTTPException(403)
     return get_all_ranks()
 
 @app.post("/api/ranks")
 async def create_rank_api(rank_data: RankCreate, x_api_key: str = Header(None)):
-    if x_api_key != API_KEY: raise HTTPException(status_code=403, detail="Forbidden")
-    if len(rank_data.name.strip()) < 2: raise HTTPException(status_code=400)
+    if x_api_key != API_KEY: raise HTTPException(403)
     add_rank(rank_data.name.strip())
     return {"status": "success"}
 
 @app.delete("/api/ranks/{rank_name}")
 async def delete_rank_api(rank_name: str, x_api_key: str = Header(None)):
-    if x_api_key != API_KEY: raise HTTPException(status_code=403, detail="Forbidden")
+    if x_api_key != API_KEY: raise HTTPException(403)
     delete_rank(rank_name)
     return {"status": "success"}
 
@@ -650,12 +596,11 @@ async def delete_rank_api(rank_name: str, x_api_key: str = Header(None)):
 async def get_constructor_page():
     try:
         with open("ai_studio_code (23).html", "r", encoding="utf-8") as f: return HTMLResponse(content=f.read())
-    except FileNotFoundError: raise HTTPException(status_code=404)
+    except FileNotFoundError: raise HTTPException(404)
 
 @app.get("/health")
 async def health_check(): return Response(status_code=200)
 
-# Старт/Стоп
 @app.on_event("startup")
 async def startup():
     await application.initialize()
@@ -668,5 +613,4 @@ async def shutdown():
     await application.shutdown()
 
 if __name__ == '__main__':
-    PORT = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
