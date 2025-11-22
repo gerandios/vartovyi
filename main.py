@@ -1,7 +1,9 @@
 import os
 import logging
 import calendar
+import re  # <--- ДОДАНО: Необхідно для валідації
 from datetime import datetime, date, timedelta, timezone
+from zoneinfo import ZoneInfo  # <--- ДОДАНО: Для роботи з Київським часом
 from typing import List
 
 from fastapi import FastAPI, Request, HTTPException, Header, Response, status
@@ -32,99 +34,67 @@ from psycopg.rows import dict_row
 
 import uvicorn
 
-# --- Настройка логирования ---
+# --- Настройка таймзони ---
+# Це гарантує, що всі перевірки часу (16:00, 17:00) працюють по Києву, а не по Лондону
+KYIV_TZ = ZoneInfo("Europe/Kiev")
+
+# --- Настройка логування ---
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# --- Переменные окружения ---
+# --- Змінні оточення ---
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 DATABASE_URL = os.getenv('DATABASE_URL')
 API_KEY = os.getenv('API_KEY')
-# Получаем внешний хост. Если не задан, используем localhost для локальных тестов
 DOMAIN = os.getenv('RENDER_EXTERNAL_HOSTNAME')
 ADMIN_IDS_STR = os.getenv('ADMIN_IDS', '')
-ADMIN_IDS = [int(admin_id) for admin_id in ADMIN_IDS_STR.split(',') if admin_id.strip()]
+# Захист від помилки, якщо ADMIN_IDS порожній
+ADMIN_IDS = [int(aid) for aid in ADMIN_IDS_STR.split(',') if aid.strip().isdigit()]
 
 if not all([BOT_TOKEN, DATABASE_URL, API_KEY, DOMAIN]):
-    # Можно не поднимать ошибку для ADMIN_IDS, если список пуст, но лучше предупредить
-    logger.warning("Внимание: Переменные окружения проверены. Убедитесь, что ADMIN_IDS заполнен.")
+    logger.warning("⚠️ Увага: Деякі змінні оточення не задані!")
 
 WEBHOOK_PATH = '/webhook'
 WEBHOOK_URL = f"https://{DOMAIN}{WEBHOOK_PATH}"
 
-# --- Пул соединений с базой данных ---
+# --- Пул з'єднань ---
 pool = ConnectionPool(DATABASE_URL, min_size=1, max_size=10, open=True)
 
-
-# --- МИГРАЦИЯ БАЗЫ ДАННЫХ ---
+# --- МІГРАЦІЯ ---
 def migrate_database():
-    """Проверяет и обновляет схему БД, добавляет таблицу ranks."""
-    logger.info("Checking and migrating database schema...")
+    logger.info("Checking DB schema...")
     try:
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                # 1. Таблица users
                 cur.execute("CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY, rank VARCHAR, name VARCHAR, username VARCHAR, group_number VARCHAR, registration_date TIMESTAMP WITH TIME ZONE NOT NULL);")
-                
-                # Проверка на старую колонку registered_name (для обратной совместимости/миграции)
-                cur.execute("SELECT 1 FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'registered_name';")
-                if cur.fetchone():
-                    logger.warning("Old 'registered_name' column found. Migrating data...")
-                    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS rank VARCHAR; ADD COLUMN IF NOT EXISTS name VARCHAR;")
-                    cur.execute("SELECT user_id, registered_name FROM users WHERE rank IS NULL AND name IS NULL;")
-                    for user in cur.fetchall():
-                        full_name = user['registered_name']
-                        parts = full_name.split(' ')
-                        user_rank = ""
-                        user_name_parts = []
-                        if len(parts) > 1 and parts[0].lower() == 'ст.' and parts[1].lower() == 'солдат':
-                            user_rank = "ст. солдат"
-                            user_name_parts = parts[2:]
-                        elif len(parts) > 0 and parts[0].lower() == 'солдат':
-                            user_rank = "солдат"
-                            user_name_parts = parts[1:]
-                        else:
-                            user_rank = parts[0] if parts else "невідомо"
-                            user_name_parts = parts[1:]
-                        user_name = ' '.join(user_name_parts)
-                        cur.execute("UPDATE users SET rank = %s, name = %s WHERE user_id = %s", (user_rank, user_name, user['user_id']))
-                    cur.execute("ALTER TABLE users DROP COLUMN registered_name;")
-                    logger.info("Migration from 'registered_name' completed.")
-                
-                # 2. Таблица registrations
                 cur.execute("CREATE TABLE IF NOT EXISTS registrations (id SERIAL PRIMARY KEY, user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE, event_type VARCHAR NOT NULL, event_date DATE NOT NULL, reason VARCHAR, return_info VARCHAR, UNIQUE (user_id, event_date));")
-                
-                # 3. Таблица ranks
                 cur.execute("CREATE TABLE IF NOT EXISTS ranks (id SERIAL PRIMARY KEY, name VARCHAR UNIQUE NOT NULL);")
-                logger.info("Table 'ranks' is present.")
                 
-                default_ranks = ['солдат', 'ст. солдат']
+                # Дефолтні звання
+                default_ranks = ['солдат', 'ст. солдат', 'молодший сержант', 'сержант']
                 for rank_name in default_ranks:
                     cur.execute("INSERT INTO ranks (name) VALUES (%s) ON CONFLICT (name) DO NOTHING;", (rank_name,))
-                logger.info("Default ranks are present.")
-
+                
                 conn.commit()
-        logger.info("Database schema is up to date.")
+        logger.info("Database ready.")
     except Exception as e:
         logger.error(f"FATAL: Database migration failed: {e}")
         raise
 
-# Выполняем миграцию при старте приложения
 migrate_database()
 
-
-# --- Состояния для ConversationHandler ---
+# --- СТАНИ ---
 (
-    REG_NAME, REG_GROUP, MAIN_MENU, CHOOSE_DATE, CHOOSE_TYPE,
-    CHOOSE_DOVOBE_REASON, CHOOSE_DOZVIL_TIME
-) = range(7)
+    REG_RANK, REG_SURNAME, REG_FIRSTNAME, REG_GROUP,  # Етапи реєстрації
+    MAIN_MENU, 
+    CHOOSE_DATE, CHOOSE_TYPE, CHOOSE_DOVOBE_REASON, CHOOSE_DOZVIL_TIME
+) = range(9)
 
 
-# --- Функции для работы с БД ---
-
+# --- БД ФУНКЦІЇ (Синхронні) ---
 def insert_user(user_id: int, rank: str, name: str, username: str | None, group_number: str) -> None:
     with pool.connection() as conn:
         conn.execute(
@@ -154,14 +124,9 @@ def get_all_users() -> list:
 
 def update_user_from_admin(user_id: int, rank: str, name: str, group_number: str) -> None:
     with pool.connection() as conn:
-        conn.execute(
-            "UPDATE users SET rank = %s, name = %s, group_number = %s WHERE user_id = %s",
-            (rank, name, group_number, user_id)
-        )
+        conn.execute("UPDATE users SET rank = %s, name = %s, group_number = %s WHERE user_id = %s", (rank, name, group_number, user_id))
 
 def insert_registration(user_id: int, event_type: str, event_date: date, reason: str | None, return_info: str | None) -> bool:
-    if event_type not in ('Звичайне', 'Добове'):
-        raise ValueError('Invalid event_type')
     try:
         with pool.connection() as conn:
             conn.execute(
@@ -175,10 +140,7 @@ def insert_registration(user_id: int, event_type: str, event_date: date, reason:
 def get_user_registrations(user_id: int) -> list:
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(
-                "SELECT * FROM registrations WHERE user_id = %s AND event_date >= %s ORDER BY event_date ASC",
-                (user_id, date.today())
-            )
+            cur.execute("SELECT * FROM registrations WHERE user_id = %s AND event_date >= %s ORDER BY event_date ASC", (user_id, date.today()))
             return cur.fetchall()
 
 def delete_registration(reg_id: int) -> None:
@@ -188,6 +150,7 @@ def delete_registration(reg_id: int) -> None:
 def get_lists_for_date(target_date: date) -> dict:
     with pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
+            # concat rank + name
             cur.execute(
                 """
                 SELECT r.event_type, CONCAT(u.rank, ' ', u.name) AS full_name, u.username, u.group_number,
@@ -207,14 +170,11 @@ def clear_future_registrations() -> int:
     with pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM registrations WHERE event_date >= %s", (date.today(),))
-            deleted_rows = cur.rowcount
-    logger.info(f"Admin cleared {deleted_rows} future registrations.")
-    return deleted_rows
+            return cur.rowcount
 
 def wipe_all_data() -> None:
     with pool.connection() as conn:
         conn.execute("TRUNCATE TABLE registrations, users, ranks RESTART IDENTITY;")
-    logger.warning("Admin WIPED ALL DATA from users, registrations and ranks tables.")
 
 def get_all_ranks() -> List[str]:
     with pool.connection() as conn:
@@ -233,29 +193,24 @@ def delete_rank(rank_name: str):
     with pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM users WHERE rank = %s;", (rank_name,))
-            count = cur.fetchone()[0]
-            if count > 0:
-                raise HTTPException(status_code=409, detail=f"Cannot delete rank '{rank_name}' because it is in use by {count} user(s).")
+            if cur.fetchone()[0] > 0:
+                raise HTTPException(status_code=409, detail="Rank is in use.")
             cur.execute("DELETE FROM ranks WHERE name = %s;", (rank_name,))
-            if cur.rowcount == 0:
-                raise HTTPException(status_code=404, detail="Rank not found.")
 
-
-# --- Вспомогательные функции для бота ---
+# --- UI ФУНКЦІЇ ---
 def create_calendar(year: int, month: int) -> InlineKeyboardMarkup:
     keyboard = []
     uk_month_names = ["", "Січень", "Лютий", "Березень", "Квітень", "Травень", "Червень", "Липень", "Серпень", "Вересень", "Жовтень", "Листопад", "Грудень"]
-    header = f"{uk_month_names[month]} {year}"
-    keyboard.append([InlineKeyboardButton(header, callback_data='ignore')])
-    days = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
-    keyboard.append([InlineKeyboardButton(day, callback_data='ignore') for day in days])
+    keyboard.append([InlineKeyboardButton(f"{uk_month_names[month]} {year}", callback_data='ignore')])
+    keyboard.append([InlineKeyboardButton(day, callback_data='ignore') for day in ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]])
+    
     month_calendar = calendar.monthcalendar(year, month)
     
-    now = datetime.now()
-    today = now.date()
-    current_hour = now.hour
+    # Отримуємо час по Києву!
+    now_kyiv = datetime.now(KYIV_TZ)
+    today = now_kyiv.date()
+    current_hour = now_kyiv.hour
     
-    # Определяем минимально доступную дату
     if current_hour < 16:
         min_available_date = today
     else:
@@ -273,26 +228,27 @@ def create_calendar(year: int, month: int) -> InlineKeyboardMarkup:
                 else:
                     row.append(InlineKeyboardButton(str(day), callback_data=f'day:{current_date.isoformat()}'))
         keyboard.append(row)
-    prev_month_date = date(year, month, 1) - timedelta(days=1)
-    next_month_date = date(year, month, 1) + timedelta(days=32)
-    nav_row = [
-        InlineKeyboardButton("<", callback_data=f'nav:{prev_month_date.year}:{prev_month_date.month}'),
-        InlineKeyboardButton(">", callback_data=f'nav:{next_month_date.year}:{next_month_date.month}')
-    ]
-    keyboard.append(nav_row)
+        
+    # Навігація
+    prev_d = date(year, month, 1) - timedelta(days=1)
+    next_d = date(year, month, 1) + timedelta(days=32)
+    keyboard.append([
+        InlineKeyboardButton("<", callback_data=f'nav:{prev_d.year}:{prev_d.month}'),
+        InlineKeyboardButton(">", callback_data=f'nav:{next_d.year}:{next_d.month}')
+    ])
     return InlineKeyboardMarkup(keyboard)
 
 async def show_main_menu(update: Update, context: CallbackContext):
     keyboard = [['Записатись на звільнення', 'Мої записи']]
     await update.message.reply_text('Головне меню:', reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
 
-
-# --- Логика бота (Регистрация, запись на увольнение и т.д.) ---
+# --- ЛОГІКА БОТА: СТАРТ ТА РЕЄСТРАЦІЯ ---
 
 async def start_router(update: Update, context: CallbackContext) -> int:
     user_id = update.effective_user.id
     context.user_data.clear()
     user = get_user(user_id)
+    
     if user:
         await update.message.reply_text(
             f"Вітаю, {user['rank']} {user['name']}!\nОберіть дію:",
@@ -300,66 +256,134 @@ async def start_router(update: Update, context: CallbackContext) -> int:
         )
         return MAIN_MENU
     else:
+        ranks = get_all_ranks()
+        keyboard = []
+        row = []
+        for r in ranks:
+            row.append(r.capitalize())
+            if len(row) == 2:
+                keyboard.append(row)
+                row = []
+        if row:
+            keyboard.append(row)
+            
         await update.message.reply_text(
-            """Вітаю! Для використання бота пройдіть реєстрацію.
-Введіть ваше звання та прізвище з ініціалами (наприклад, ст. солдат К.Пижко)""",
-            reply_markup=ReplyKeyboardRemove(),
+            "Вітаю! Розпочнемо реєстрацію.\n\n"
+            "1️⃣ **Крок 1 з 4:**\n"
+            "Оберіть ваше **звання** за допомогою кнопок меню:",
+            reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
+            parse_mode='Markdown'
         )
-        return REG_NAME
+        return REG_RANK
 
-async def register_name(update: Update, context: CallbackContext) -> int:
-    user_input = update.message.text.strip()
-    parts = user_input.split(' ')
+# 1. Валідація звання
+async def register_rank(update: Update, context: CallbackContext) -> int:
+    selected_rank = update.message.text.lower()
+    available_ranks = [r.lower() for r in get_all_ranks()]
     
-    user_rank = ""
-    name_parts = []
+    if selected_rank not in available_ranks:
+        await update.message.reply_text("⚠️ Будь ласка, оберіть звання, натиснувши на кнопку внизу.")
+        return REG_RANK
 
-    # Получаем актуальные звания из БД для проверки
-    available_ranks = get_all_ranks()
+    context.user_data['rank'] = selected_rank
     
-    # Пытаемся сопоставить ввод с доступными званиями
-    potential_long_rank = " ".join(parts[:2]).lower()
-    if potential_long_rank in available_ranks:
-        user_rank = potential_long_rank
-        name_parts = parts[2:]
-    elif len(parts) > 0 and parts[0].lower() in available_ranks:
-        user_rank = parts[0].lower()
-        name_parts = parts[1:]
-    else:
-        await update.message.reply_text(f"Не вдалося розпізнати звання. Дозволені звання: {', '.join(available_ranks)}. Спробуйте ще раз.")
-        return REG_NAME
+    await update.message.reply_text(
+        "✅ Звання прийнято.\n\n"
+        "2️⃣ **Крок 2 з 4:**\n"
+        "Введіть ваше **ПРІЗВИЩЕ** (лише прізвище).\n"
+        "📌 *Приклад:* Шевченко",
+        reply_markup=ReplyKeyboardRemove(),
+        parse_mode='Markdown'
+    )
+    return REG_SURNAME
 
-    if not name_parts:
-        await update.message.reply_text("Будь ласка, введіть і звання, і прізвище. Наприклад: солдат Іваненко І.І.\nСпробуйте ще раз.")
-        return REG_NAME
-
-    context.user_data['rank'] = user_rank
-    context.user_data['name'] = ' '.join(name_parts)
+# 2. Валідація прізвища
+async def register_surname(update: Update, context: CallbackContext) -> int:
+    raw_text = update.message.text.strip()
     
-    await update.message.reply_text('Дякую! Тепер введіть номер вашої навчальної групи (наприклад, 311).')
+    if len(raw_text) < 2:
+        await update.message.reply_text("⚠️ Прізвище занадто коротке. Спробуйте ще раз.")
+        return REG_SURNAME
+
+    # Дозволяємо літери, дефіс, апостроф. Забороняємо цифри та спецсимволи.
+    if not re.match(r"^[a-zA-Zа-яА-ЯіІїЇєЄґҐ\-\']+$", raw_text):
+        await update.message.reply_text("⚠️ Прізвище повинно містити **тільки літери**. Без цифр, смайлів та пробілів.\nСпробуйте ще раз.", parse_mode='Markdown')
+        return REG_SURNAME
+
+    context.user_data['surname'] = raw_text.capitalize()
+    
+    await update.message.reply_text(
+        "✅ Прізвище прийнято.\n\n"
+        "3️⃣ **Крок 3 з 4:**\n"
+        "Введіть ваше **ІМ'Я** або **ІНІЦІАЛИ**.\n"
+        "📌 *Приклад:* Тарас або Т.Г.",
+        parse_mode='Markdown'
+    )
+    return REG_FIRSTNAME
+
+# 3. Валідація імені
+async def register_firstname(update: Update, context: CallbackContext) -> int:
+    raw_text = update.message.text.strip()
+    
+    if len(raw_text) < 1 or len(raw_text) > 30:
+        await update.message.reply_text("⚠️ Некоректна довжина. Введіть нормально (Ім'я або Ініціали).")
+        return REG_FIRSTNAME
+    
+    # Якщо тільки цифри/символи
+    if re.match(r"^[\d\s\W]+$", raw_text) and not re.search(r"[a-zA-Zа-яА-Я]", raw_text):
+         await update.message.reply_text("⚠️ Ім'я не може складатися тільки з цифр або символів.")
+         return REG_FIRSTNAME
+
+    surname = context.user_data['surname']
+    full_name = f"{surname} {raw_text.title()}"
+    context.user_data['name'] = full_name
+    
+    await update.message.reply_text(
+        "✅ Прийнято.\n\n"
+        "4️⃣ **Крок 4 з 4:**\n"
+        "Введіть номер вашої **ГРУПИ**.\n"
+        "⚠️ **ТІЛЬКИ ЦИФРИ** (наприклад: 311)",
+        parse_mode='Markdown'
+    )
     return REG_GROUP
 
+# 4. Валідація групи
 async def register_group(update: Update, context: CallbackContext) -> int:
     group_number = update.message.text.strip()
+    
     if not group_number.isdigit():
-        await update.message.reply_text("Невірний формат. Номер групи має складатися лише з цифр. Спробуйте ще раз.")
+        await update.message.reply_text("⛔️ Помилка! Номер групи має складатися **тільки з цифр**.\nВведіть ще раз:", parse_mode='Markdown')
         return REG_GROUP
     
+    if len(group_number) > 5:
+        await update.message.reply_text("⛔️ Занадто довгий номер групи.")
+        return REG_GROUP
+
     rank = context.user_data['rank']
     name = context.user_data['name']
     
     insert_user(update.effective_user.id, rank, name, update.effective_user.username, group_number)
-    await update.message.reply_text(f'Реєстрацію завершено! Ви зареєстровані як {rank} {name}, група {group_number}.')
+    
+    await update.message.reply_text(
+        f'✅ **РЕЄСТРАЦІЮ ЗАВЕРШЕНО!**\n\n'
+        f'👤 **Дані:** {rank.capitalize()} {name}\n'
+        f'🎓 **Група:** {group_number}\n\n'
+        f'Тепер ви можете користуватися меню.',
+        parse_mode='Markdown'
+    )
     await show_main_menu(update, context)
     context.user_data.clear()
     return MAIN_MENU
 
+
+# --- ЛОГІКА БОТА: МЕНЮ І ЗАПИС ---
+
 async def handle_menu_choice(update: Update, context: CallbackContext) -> int:
     text = update.message.text.strip()
     if text == 'Записатись на звільнення':
-        now = datetime.now()
-        current_hour = now.hour
-        today = date.today()
+        now_kyiv = datetime.now(KYIV_TZ) # ВИПРАВЛЕНО ЧАС
+        current_hour = now_kyiv.hour
+        today = now_kyiv.date()
         tomorrow = today + timedelta(days=1)
         
         keyboard = []
@@ -372,6 +396,7 @@ async def handle_menu_choice(update: Update, context: CallbackContext) -> int:
         
         await update.message.reply_text('Оберіть дату звільнення:', reply_markup=InlineKeyboardMarkup(keyboard))
         return CHOOSE_DATE
+    
     elif text == 'Мої записи':
         regs = get_user_registrations(update.effective_user.id)
         if not regs:
@@ -393,7 +418,7 @@ async def date_callback_handler(update: Update, context: CallbackContext) -> int
     data = query.data
 
     if data == 'calendar':
-        now = datetime.now()
+        now = datetime.now(KYIV_TZ)
         await query.edit_message_text("Оберіть дату:", reply_markup=create_calendar(now.year, now.month))
         return CHOOSE_DATE
     elif data.startswith('nav:'):
@@ -403,7 +428,7 @@ async def date_callback_handler(update: Update, context: CallbackContext) -> int
     elif data.startswith('day:'):
         selected_date = date.fromisoformat(data.split(':')[1])
         
-        now = datetime.now()
+        now = datetime.now(KYIV_TZ) # ВИПРАВЛЕНО
         today = now.date()
         current_hour = now.hour
         
@@ -414,17 +439,20 @@ async def date_callback_handler(update: Update, context: CallbackContext) -> int
         context.user_data['selected_date'] = selected_date
         day_of_week = selected_date.weekday()
         text = f"Обрана дата: {selected_date:%d.%m.%Y}. Оберіть тип звільнення:"
-        if 0 <= day_of_week <= 4:
+        
+        # Логіка вихідних
+        if 0 <= day_of_week <= 4: # Пн-Пт
             keyboard = [[InlineKeyboardButton('Звичайне (до 21:30)', callback_data='type:Звичайне')],
                         [InlineKeyboardButton('Добове', callback_data='type:Добове')]]
-        elif day_of_week == 5:
+        elif day_of_week == 5: # Субота
             text = f"Обрана дата: {selected_date:%d.%m.%Y} (Субота).\nВихід о 17:00. Оберіть тип:"
             keyboard = [[InlineKeyboardButton('Звичайне (до 21:30)', callback_data='type:Звичайне')],
                         [InlineKeyboardButton('Добове (до 08:30)', callback_data='type:Добове:auto_saturday')]]
-        else:
+        else: # Неділя
             text = f"Обрана дата: {selected_date:%d.%m.%Y} (Неділя).\nВихід о 09:00. Оберіть тип:"
             keyboard = [[InlineKeyboardButton('Звичайне (до 21:30)', callback_data='type:Звичайне')],
                         [InlineKeyboardButton('Добове', callback_data='type:Добове')]]
+                        
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
         return CHOOSE_TYPE
 
@@ -443,7 +471,6 @@ async def choose_type(update: Update, context: CallbackContext) -> int:
                     [InlineKeyboardButton('Маю дозвіл Н.І.', callback_data='reason:дозвіл')]]
         await query.edit_message_text("Вкажіть підставу для добового звільнення:", reply_markup=InlineKeyboardMarkup(keyboard))
         return CHOOSE_DOVOBE_REASON
-    await query.edit_message_text("Сталася помилка, спробуйте ще раз.")
     return MAIN_MENU
 
 async def choose_dovobe_reason(update: Update, context: CallbackContext) -> int:
@@ -472,14 +499,15 @@ async def save_registration(update: Update, context: CallbackContext, reason: st
     selected_date = context.user_data.get('selected_date')
     event_type = context.user_data.get('event_type')
     query = update.callback_query
+    
     if not all([selected_date, event_type]):
-        await query.edit_message_text("Помилка сесії. Почніть знову з головного меню.")
+        await query.edit_message_text("❌ Помилка сесії. Почніть знову.")
         context.user_data.clear()
         return MAIN_MENU
+        
     insert_registration(user_id, event_type, selected_date, reason, return_info)
     msg = f"✅ Запис оновлено!\n📅 Дата: {selected_date:%d.%m.%Y}\n📋 Тип: {event_type}\n"
-    if reason:
-        msg += f"📝 Підстава: {reason}\n"
+    if reason: msg += f"📝 Підстава: {reason}\n"
     msg += f"⏰ Повернення: {return_info}"
     await query.edit_message_text(msg)
     context.user_data.clear()
@@ -492,6 +520,7 @@ async def cancel(update: Update, context: CallbackContext) -> int:
     elif update.message:
         await update.message.reply_text("Дію скасовано.", reply_markup=ReplyKeyboardRemove())
     context.user_data.clear()
+    # Повертаємо меню, якщо юзер вже зареєстрований
     if get_user(update.effective_user.id):
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
@@ -519,49 +548,34 @@ async def admin_panel_callback(update: Update, context: CallbackContext):
     action = query.data.split(':')[1]
     if action == 'clear_regs':
         count = clear_future_registrations()
-        await query.edit_message_text(f"✅ Усі майбутні записи ({count} шт.) видалено.")
+        await query.edit_message_text(f"✅ Видалено {count} записів.")
     elif action == 'wipe_all':
         wipe_all_data()
-        await query.edit_message_text("✅🔴 УСІ дані (користувачі, записи, звання) було повністю видалено з бази даних.")
+        await query.edit_message_text("✅🔴 БАЗА ДАНИХ ОЧИЩЕНА.")
     elif action == 'cancel':
-        await query.edit_message_text("Дію скасовано.")
+        await query.edit_message_text("Скасовано.")
 
 async def ignore_callback(update: Update, context: CallbackContext):
     if update.callback_query: await update.callback_query.answer()
 
-
-# --- Настройка FastAPI ---
+# --- FastAPI & Application ---
 app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["X-API-Key", "Content-Type"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-# --- Модели Pydantic для валидации данных API ---
-class UserUpdate(BaseModel):
-    rank: str
-    name: str
-    group_number: str
-
-class RankCreate(BaseModel):
-    name: str
-
-
-# --- Инициализация бота и хендлеров ---
 application = ApplicationBuilder().token(BOT_TOKEN).build()
+
 conv_handler = ConversationHandler(
     entry_points=[
         CommandHandler('start', start_router),
         MessageHandler(filters.TEXT & ~filters.COMMAND, start_router)
     ],
     states={
-        REG_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_name)],
+        REG_RANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_rank)],
+        REG_SURNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_surname)],
+        REG_FIRSTNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_firstname)],
         REG_GROUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_group)],
+        
         MAIN_MENU: [
-            # ИСПРАВЛЕНО: добавлены закрывающие кавычки
             MessageHandler(filters.Regex('^Записатись на звільнення$'), handle_menu_choice),
             MessageHandler(filters.Regex('^Мої записи$'), handle_menu_choice),
         ],
@@ -576,11 +590,17 @@ application.add_handler(conv_handler)
 application.add_handler(CallbackQueryHandler(cancel_registration, pattern='^cancel:'))
 application.add_handler(CommandHandler('admin', admin_panel))
 application.add_handler(CallbackQueryHandler(admin_panel_callback, pattern='^admin:'))
-# ИСПРАВЛЕНО: добавлена закрывающая кавычка
 application.add_handler(CallbackQueryHandler(ignore_callback, pattern='^ignore'))
 
+# --- API Routes ---
+class UserUpdate(BaseModel):
+    rank: str
+    name: str
+    group_number: str
 
-# --- Роуты FastAPI ---
+class RankCreate(BaseModel):
+    name: str
+
 @app.post(WEBHOOK_PATH)
 async def process_update(request: Request):
     update_data = await request.json()
@@ -590,75 +610,60 @@ async def process_update(request: Request):
 
 @app.get("/api/lists/{date_str}")
 async def get_lists_api(date_str: str, x_api_key: str = Header(None)):
-    if x_api_key != API_KEY:
-        raise HTTPException(status_code=403, detail="Forbidden: Invalid API Key")
+    if x_api_key != API_KEY: raise HTTPException(status_code=403, detail="Forbidden")
     try:
         target_date = date.fromisoformat(date_str)
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+        raise HTTPException(status_code=400, detail="Invalid date")
     return get_lists_for_date(target_date)
 
-@app.get("/api/users", response_model=List[dict])
+@app.get("/api/users")
 async def get_users_list_api(x_api_key: str = Header(None)):
-    if x_api_key != API_KEY:
-        raise HTTPException(status_code=403, detail="Forbidden: Invalid API Key")
+    if x_api_key != API_KEY: raise HTTPException(status_code=403, detail="Forbidden")
     return get_all_users()
 
 @app.put("/api/users/{user_id}")
 async def update_user_api(user_id: int, user_data: UserUpdate, x_api_key: str = Header(None)):
-    if x_api_key != API_KEY:
-        raise HTTPException(status_code=403, detail="Forbidden: Invalid API Key")
-    try:
-        update_user_from_admin(user_id, user_data.rank, user_data.name, user_data.group_number)
-        return {"status": "success", "message": f"User {user_id} updated."}
-    except Exception as e:
-        logger.error(f"Failed to update user {user_id}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to update user data.")
+    if x_api_key != API_KEY: raise HTTPException(status_code=403, detail="Forbidden")
+    update_user_from_admin(user_id, user_data.rank, user_data.name, user_data.group_number)
+    return {"status": "success"}
 
-@app.get("/api/ranks", response_model=List[str])
+@app.get("/api/ranks")
 async def get_ranks_api(x_api_key: str = Header(None)):
-    if x_api_key != API_KEY:
-        raise HTTPException(status_code=403, detail="Forbidden: Invalid API Key")
+    if x_api_key != API_KEY: raise HTTPException(status_code=403, detail="Forbidden")
     return get_all_ranks()
 
 @app.post("/api/ranks")
 async def create_rank_api(rank_data: RankCreate, x_api_key: str = Header(None)):
-    if x_api_key != API_KEY:
-        raise HTTPException(status_code=403, detail="Forbidden: Invalid API Key")
-    if not rank_data.name or len(rank_data.name.strip()) < 2:
-        raise HTTPException(status_code=400, detail="Rank name is too short.")
+    if x_api_key != API_KEY: raise HTTPException(status_code=403, detail="Forbidden")
+    if len(rank_data.name.strip()) < 2: raise HTTPException(status_code=400)
     add_rank(rank_data.name.strip())
-    return {"status": "success", "message": f"Rank '{rank_data.name}' created."}
+    return {"status": "success"}
 
 @app.delete("/api/ranks/{rank_name}")
 async def delete_rank_api(rank_name: str, x_api_key: str = Header(None)):
-    if x_api_key != API_KEY:
-        raise HTTPException(status_code=403, detail="Forbidden: Invalid API Key")
+    if x_api_key != API_KEY: raise HTTPException(status_code=403, detail="Forbidden")
     delete_rank(rank_name)
-    return {"status": "success", "message": f"Rank '{rank_name}' deleted."}
+    return {"status": "success"}
 
 @app.get("/constructor", response_class=HTMLResponse)
 async def get_constructor_page():
     try:
-        with open("ai_studio_code (23).html", "r", encoding="utf-8") as f:
-            html_content = f.read()
-        return HTMLResponse(content=html_content)
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="File 'ai_studio_code (23).html' not found.")
+        with open("ai_studio_code (23).html", "r", encoding="utf-8") as f: return HTMLResponse(content=f.read())
+    except FileNotFoundError: raise HTTPException(status_code=404)
 
-@app.api_route("/health", methods=["GET", "HEAD"], status_code=status.HTTP_200_OK)
-async def health_check():
-    return Response(status_code=status.HTTP_200_OK)
+@app.get("/health")
+async def health_check(): return Response(status_code=200)
 
+# Старт/Стоп
 @app.on_event("startup")
 async def startup():
     await application.initialize()
     await application.bot.set_webhook(url=WEBHOOK_URL)
-    logger.info(f"Webhook has been set to {WEBHOOK_URL}")
+    logger.info(f"Webhook set to {WEBHOOK_URL}")
 
 @app.on_event("shutdown")
 async def shutdown():
-    logger.info("Closing database connection pool.")
     pool.close()
     await application.shutdown()
 
